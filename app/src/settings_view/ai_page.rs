@@ -3918,21 +3918,11 @@ pub enum AISettingsPageAction {
     },
     /// 触发一次 models.dev 目录加载(磁盘缓存 + 必要时网络刷新)。Providers 子页打开即触发。
     EnsureModelsDevLoaded,
-    /// 强制刷新 models.dev 目录(忽略 TTL)。"刷新" 按钮触发。
-    RefreshModelsDev,
-    /// 从 models.dev 目录创建一个新 provider:回填 name/base_url/全部模型(含 context)。
-    AddProviderFromModelsDev {
-        catalog_provider_id: String,
-    },
     /// 把现有 provider 的模型列表与 models.dev 同步(按 base_url 匹配),
     /// 用 catalog 提供的 context_window / reasoning / tool_call 等元数据填充本地条目。
     SyncProviderModelsFromModelsDev {
         provider_id: String,
     },
-    /// 折叠/展开 "快速添加" chip 行。
-    ToggleModelsDevChipsExpanded,
-    /// 设置 "快速添加" chip 行的搜索 query(子串过滤 provider name/id)。
-    SetModelsDevSearchQuery(String),
 
     // ----- 单条模型条目 detail panel -----
     /// 切换单条模型的 detail panel 展开/折叠状态。
@@ -5199,12 +5189,10 @@ impl TypedActionView for AISettingsPageView {
                         async move { models_dev::fetch_and_cache(client).await },
                         |view, result, ctx| match result {
                             Ok(()) => {
-                                models_dev::set_fetch_failed(false);
                                 view.rebuild_current_page(ctx);
                             }
                             Err(e) => {
                                 log::warn!("[models.dev] 拉取失败: {e}");
-                                models_dev::set_fetch_failed(true);
                                 ctx.notify();
                             }
                         },
@@ -5212,57 +5200,6 @@ impl TypedActionView for AISettingsPageView {
                 } else {
                     ctx.notify();
                 }
-            }
-            AISettingsPageAction::RefreshModelsDev => {
-                use crate::ai::agent_providers::models_dev;
-                let client = http_client::Client::new();
-                ctx.spawn(
-                    async move { models_dev::fetch_and_cache(client).await },
-                    |view, result, ctx| match result {
-                        Ok(()) => {
-                            models_dev::set_fetch_failed(false);
-                            view.rebuild_current_page(ctx);
-                        }
-                        Err(e) => {
-                            log::warn!("[models.dev] 刷新失败: {e}");
-                            models_dev::set_fetch_failed(true);
-                            ctx.notify();
-                        }
-                    },
-                );
-            }
-            AISettingsPageAction::AddProviderFromModelsDev {
-                catalog_provider_id,
-            } => {
-                use crate::ai::agent_providers::models_dev;
-                let Some(catalog) = models_dev::cached() else {
-                    log::warn!("[models.dev] 目录尚未加载,无法添加 {catalog_provider_id}");
-                    return;
-                };
-                let Some(cat_provider) = catalog.get(catalog_provider_id) else {
-                    log::warn!("[models.dev] 目录中无 provider id: {catalog_provider_id}");
-                    return;
-                };
-                let mut new_provider = crate::settings::AgentProvider::new_empty();
-                new_provider.name = if cat_provider.name.is_empty() {
-                    catalog_provider_id.clone()
-                } else {
-                    cat_provider.name.clone()
-                };
-                if let Some(api) = &cat_provider.api {
-                    new_provider.base_url = api.clone();
-                }
-                new_provider.models = cat_provider
-                    .models
-                    .values()
-                    .map(models_dev::into_agent_provider_model)
-                    .collect();
-                AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    let mut providers = settings.agent_providers.value().clone();
-                    providers.push(new_provider);
-                    let _ = settings.agent_providers.set_value(providers, ctx);
-                });
-                self.rebuild_current_page(ctx);
             }
             AISettingsPageAction::SyncProviderModelsFromModelsDev { provider_id } => {
                 use crate::ai::agent_providers::models_dev;
@@ -5342,16 +5279,6 @@ impl TypedActionView for AISettingsPageView {
                     let _ = settings.agent_providers.set_value(providers, ctx);
                 });
                 self.rebuild_current_page(ctx);
-            }
-            AISettingsPageAction::ToggleModelsDevChipsExpanded => {
-                use crate::ai::agent_providers::models_dev;
-                models_dev::toggle_chips_expanded();
-                ctx.notify();
-            }
-            AISettingsPageAction::SetModelsDevSearchQuery(q) => {
-                use crate::ai::agent_providers::models_dev;
-                models_dev::set_search_query(q.clone());
-                ctx.notify();
             }
             AISettingsPageAction::ToggleAgentProviderModelExpanded {
                 provider_id,

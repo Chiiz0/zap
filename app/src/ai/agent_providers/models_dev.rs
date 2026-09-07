@@ -6,7 +6,7 @@
 //!
 //! 数据结构对齐 opencode 的 `provider/models.ts`:顶层是
 //! `{ <provider_id>: Provider }`,Provider 含 `models: { <model_id>: Model }`。
-//! 我们只关心 UI "快速选择" 需要的几个字段:
+//! 我们只关心模型元数据同步需要的几个字段:
 //! - provider: id / name / api / env(暗示需要哪个 env var)
 //! - model:    id / name / limit.context / limit.output / reasoning / tool_call
 //!
@@ -18,7 +18,6 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -256,73 +255,9 @@ pub async fn fetch_and_cache(client: Client) -> Result<(), String> {
     Ok(())
 }
 
-// ── chip 行折叠/展开状态(进程级,避免 widget rebuild 丢) ─────────────────
-
-static CHIPS_EXPANDED: AtomicBool = AtomicBool::new(false);
-
-pub fn chips_expanded() -> bool {
-    CHIPS_EXPANDED.load(Ordering::Relaxed)
-}
-
-pub fn toggle_chips_expanded() {
-    CHIPS_EXPANDED.fetch_xor(true, Ordering::Relaxed);
-}
-
-// ── 最近一次网络拉取失败标志 ─────────────────────────────────────────────────
-
-static FETCH_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// 最近一次网络拉取是否失败（cached() == None 时有意义）。
-pub fn last_fetch_failed() -> bool {
-    FETCH_FAILED.load(Ordering::Relaxed)
-}
-
-/// 由调用方在 spawn 回调中设置（失败 true，成功不需要重置，因为 cached() 此时为 Some）。
-pub fn set_fetch_failed(failed: bool) {
-    FETCH_FAILED.store(failed, Ordering::Relaxed);
-}
-
-// ── 快速添加 chip 行的搜索过滤 ──────────────────────────────────────────────
-
-fn search_state() -> &'static RwLock<String> {
-    static S: OnceLock<RwLock<String>> = OnceLock::new();
-    S.get_or_init(|| RwLock::new(String::new()))
-}
-
-pub fn search_query() -> String {
-    search_state()
-        .read()
-        .ok()
-        .map(|s| s.clone())
-        .unwrap_or_default()
-}
-
-pub fn set_search_query(q: String) {
-    if let Ok(mut s) = search_state().write() {
-        *s = q;
-    }
-}
-
-/// 按当前搜索 query 过滤 catalog,大小写不敏感子串匹配 provider.name 与 provider.id。
-/// 空 query 返回全部条目顺序。返回拥有所有权的 Vec 以便 UI 端 take/iter。
-pub fn filter_catalog(catalog: &Catalog, query: &str) -> Vec<(String, Provider)> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return catalog
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-    }
-    catalog
-        .iter()
-        .filter(|(id, p)| id.to_lowercase().contains(&q) || p.name.to_lowercase().contains(&q))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
-}
-
 /// 把 models.dev 的 Model 转换成本地 settings 用的 AgentProviderModel。
 ///
-/// 默认把 catalog 推断的 image/pdf/audio 写进字段(用户首次 sync / quick-add 时
+/// 默认把 catalog 推断的 image/pdf/audio 写进字段(用户首次同步时
 /// 直接看到模型能力被同步进 toml,不需要展开 detail 才看到)。
 /// 后续 sync 时调用方只往 None 槽位填新值,Some(_) 视为用户显式覆盖跳过。
 pub fn into_agent_provider_model(model: &Model) -> crate::settings::AgentProviderModel {
