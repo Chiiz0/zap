@@ -180,6 +180,8 @@ pub struct RequestParams {
     ///
     /// 默认 `None` = 兼容路径(无压缩)。
     pub compaction_state: Option<crate::ai::byop_compaction::state::CompactionState>,
+    /// 发出摘要前固定的覆盖范围，响应提交必须复用本计划。
+    pub compaction_plan: Option<crate::ai::byop_compaction::plan::CompactionPlan>,
     /// Zap BYOP repair sidecar 快照。serializer 只读使用,不在请求构造中反序列化持久化 JSON。
     pub byop_repair_state: crate::ai::byop_readiness::RepairStateStatus,
     /// Zap BYOP 专用:本轮是否需要模拟上游 CreateTask 流程来升级 optimistic CLI subtask。
@@ -283,6 +285,7 @@ impl RequestParams {
             lrc_command_id: None,
             lrc_running_command: None,
             compaction_state: None,
+            compaction_plan: None,
             byop_repair_state: Default::default(),
             lrc_should_spawn_subagent: false,
         }
@@ -506,6 +509,7 @@ impl RequestParams {
             // BYOP-only:由 controller 在 dispatch 到 BYOP exec 前回填(setter 风格,
             // 避免穿过 ConversationRequestData / 非 BYOP 路径)。
             compaction_state: None,
+            compaction_plan: None,
             byop_repair_state: Default::default(),
         }
     }

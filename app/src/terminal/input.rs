@@ -3074,6 +3074,21 @@ impl Input {
         );
 
         ctx.subscribe_to_model(&ai_controller, |me, _, event, ctx| match event {
+            BlocklistAIControllerEvent::SubmittedCompactedInput {
+                query,
+                context_snapshot,
+            } => {
+                if me.buffer_text(ctx) == *query
+                    && me.ai_context_model.as_ref(ctx).pending_context_snapshot()
+                        == *context_snapshot
+                {
+                    me.editor
+                        .update(ctx, |editor, ctx| editor.system_clear_buffer(true, ctx));
+                    me.ai_context_model
+                        .update(ctx, |context, ctx| context.reset_context_to_default(ctx));
+                    ctx.notify();
+                }
+            }
             BlocklistAIControllerEvent::SentRequest {
                 contains_user_query: is_user_initiated,
                 is_queued_prompt,

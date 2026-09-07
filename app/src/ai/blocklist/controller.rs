@@ -28,7 +28,7 @@ use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonE
 use self::response_stream::{PendingTitleGeneration, ResponseStream, ResponseStreamEvent};
 use super::action_model::{BlocklistAIActionEvent, BlocklistAIActionModel};
 use super::agent_view::{AgentViewController, AgentViewControllerEvent, AgentViewEntryOrigin};
-use super::context_model::BlocklistAIContextModel;
+use super::context_model::{BlocklistAIContextModel, PendingContextSnapshot};
 use super::history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
 use super::input_model::InputConfig;
 use super::{BlocklistAIInputModel, InputType, QueuedQueryModel, ResponseStreamId};
@@ -173,6 +173,11 @@ impl SessionContext {
 }
 
 pub enum BlocklistAIControllerEvent {
+    /// 仅在原草稿和附件均未变化时清空已经续发成功的输入。
+    SubmittedCompactedInput {
+        query: String,
+        context_snapshot: PendingContextSnapshot,
+    },
     /// Emitted when a request is sent to the AI agent API.
     SentRequest {
         contains_user_query: bool,
@@ -392,15 +397,34 @@ pub struct BlocklistAIController {
     /// 避免用户提交的 prompt 被静默丢弃。
     /// 每个 conversation 最多保留 1 条;用户后续直接提交新请求会覆盖。
     pending_byop_requests: HashMap<AIConversationId, PendingByopRequest>,
+    /// 以摘要流绑定原始待发输入；只有该摘要成功提交后才允许续发一次。
+    pending_byop_compaction_requests: HashMap<ResponseStreamId, PendingByopCompactionRequest>,
+    committed_byop_compaction_streams: HashSet<ResponseStreamId>,
+    byop_compaction_after_stream: HashSet<ResponseStreamId>,
 }
 
 /// 见 `pending_byop_requests`。
 struct PendingByopRequest {
+    allow_auto_compaction: bool,
     request_input: RequestInput,
     query_metadata: Option<RequestMetadata>,
     default_to_follow_up_on_success: bool,
     can_attempt_resume_on_error: bool,
     is_queued_prompt: bool,
+}
+
+struct PendingByopCompactionRequest {
+    request: PendingByopRequest,
+    original_query: Option<String>,
+    context_snapshot: PendingContextSnapshot,
+}
+
+fn can_continue_after_byop_compaction(
+    committed: bool,
+    cancelled: bool,
+    has_pending_work: bool,
+) -> bool {
+    committed && !cancelled && !has_pending_work
 }
 
 enum InputQueryType {
@@ -655,6 +679,9 @@ impl BlocklistAIController {
             pending_passive_follow_ups: HashSet::new(),
             pending_passive_suggestion_results: HashMap::new(),
             pending_byop_requests: HashMap::new(),
+            pending_byop_compaction_requests: HashMap::new(),
+            committed_byop_compaction_streams: HashSet::new(),
+            byop_compaction_after_stream: HashSet::new(),
         }
     }
 
@@ -1557,6 +1584,7 @@ impl BlocklistAIController {
             return false;
         };
         let PendingByopRequest {
+            allow_auto_compaction,
             mut request_input,
             query_metadata,
             default_to_follow_up_on_success,
@@ -1592,12 +1620,13 @@ impl BlocklistAIController {
             "[byop-readiness] flushing pending BYOP request after finished action \
              conversation_id={conversation_id:?}"
         );
-        if let Err(e) = self.send_request_input(
+        if let Err(e) = self.send_request_input_with_compaction(
             request_input,
             query_metadata,
             default_to_follow_up_on_success,
             can_attempt_resume_on_error,
             is_queued_prompt,
+            allow_auto_compaction,
             ctx,
         ) {
             // 二次失败时不再循环排队:若仍报 Pending,Err 已被 send_request_input 内部重新
@@ -2895,7 +2924,7 @@ impl BlocklistAIController {
             );
         });
 
-        if input_contains_user_query {
+        if input_contains_user_query && !is_queued_prompt {
             let pending_document_id = self.context_model.as_ref(ctx).pending_document_id();
             self.context_model.update(ctx, |context_model, ctx| {
                 context_model.reset_context_to_default(ctx);
@@ -2940,13 +2969,133 @@ impl BlocklistAIController {
     /// input) for an existing conversation. Consider calling [`Self::send_custom_ai_input_query`] if
     /// you're trying to send a query with a custom [`AIAgentInput`] type where you'd like the "normal"
     /// flow that handles existing conversations properly.
+    fn byop_compaction_request_input(
+        &self,
+        conversation_id: AIConversationId,
+        original: Option<&RequestInput>,
+        ctx: &ModelContext<Self>,
+    ) -> anyhow::Result<RequestInput> {
+        let conversation = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .ok_or_else(|| anyhow!("压缩目标会话不存在"))?;
+        let task_id = conversation.get_root_task_id().clone();
+        let context = input_context_for_request(
+            false,
+            self.context_model.as_ref(ctx),
+            self.active_session.as_ref(ctx),
+            Some(conversation_id),
+            vec![],
+            ctx,
+        );
+        let input = vec![AIAgentInput::SummarizeConversation {
+            prompt: None,
+            overflow: true,
+            context,
+        }];
+        let mut request = original.cloned().unwrap_or_else(|| {
+            RequestInput::for_task(
+                vec![],
+                task_id.clone(),
+                &self.active_session,
+                self.get_current_response_initiator(),
+                conversation_id,
+                self.terminal_view_id,
+                ctx,
+            )
+        });
+        request.conversation_id = conversation_id;
+        request.input_messages = HashMap::from([(task_id, input)]);
+        request.supported_tools_override = Some(vec![]);
+        Ok(request)
+    }
+
+    fn retain_input_after_failed_compaction(
+        &mut self,
+        pending: PendingByopRequest,
+        cancellation: Option<CancellationReason>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let conversation_id = pending.request_input.conversation_id;
+        // 后来提交的新请求优先；补记旧输入时沿用“已由后续请求接管”的取消语义。
+        let cancellation = if self
+            .in_flight_response_streams
+            .has_active_stream_for_conversation(conversation_id, ctx)
+        {
+            Some(CancellationReason::FollowUpSubmitted {
+                is_for_same_conversation: true,
+            })
+        } else {
+            cancellation
+        };
+        let stream_id = ResponseStreamId::new_local();
+        // 只补回原始输入的可见记录，不清空用户后来编辑的草稿或附件。
+        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+            if history
+                .update_conversation_for_new_request_input(
+                    pending.request_input,
+                    stream_id.clone(),
+                    self.terminal_view_id,
+                    ctx,
+                )
+                .is_err()
+            {
+                log::warn!("[byop-compaction] 无法恢复被摘要中断的待发输入记录");
+                return;
+            }
+            if let Some(reason) = cancellation {
+                history.mark_response_stream_cancelled(
+                    &stream_id,
+                    conversation_id,
+                    self.terminal_view_id,
+                    reason,
+                    ctx,
+                );
+            } else {
+                history.mark_response_stream_completed_with_error(
+                    RenderableAIError::ContextWindowExceeded(crate::t!(
+                        "ai-error-context-too-large"
+                    )),
+                    false,
+                    &stream_id,
+                    conversation_id,
+                    self.terminal_view_id,
+                    ctx,
+                );
+            }
+            if let Some(conversation) = history.conversation_mut(&conversation_id) {
+                conversation.cleanup_completed_response_stream(&stream_id);
+            }
+        });
+    }
+
     fn send_request_input(
+        &mut self,
+        request_input: RequestInput,
+        query_metadata: Option<RequestMetadata>,
+        default_to_follow_up_on_success: bool,
+        can_attempt_resume_on_error: bool,
+        is_queued_prompt: bool,
+        ctx: &mut ModelContext<Self>,
+    ) -> anyhow::Result<(AIConversationId, ResponseStreamId)> {
+        self.send_request_input_with_compaction(
+            request_input,
+            query_metadata,
+            default_to_follow_up_on_success,
+            can_attempt_resume_on_error,
+            is_queued_prompt,
+            true,
+            ctx,
+        )
+    }
+
+    fn send_request_input_with_compaction(
         &mut self,
         mut request_input: RequestInput,
         query_metadata: Option<RequestMetadata>,
         default_to_follow_up_on_success: bool,
         can_attempt_resume_on_error: bool,
         is_queued_prompt: bool,
+        allow_auto_compaction: bool,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<(AIConversationId, ResponseStreamId)> {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
@@ -3034,6 +3183,7 @@ impl BlocklistAIController {
                 self.pending_byop_requests.insert(
                     conversation_id,
                     PendingByopRequest {
+                        allow_auto_compaction,
                         request_input,
                         query_metadata,
                         default_to_follow_up_on_success,
@@ -3099,6 +3249,101 @@ impl BlocklistAIController {
             return Err(error);
         }
 
+        let compaction_cfg = crate::ai::byop_compaction::CompactionConfig::from_settings(ctx);
+        let is_summarization = request_params
+            .input
+            .iter()
+            .any(|input| matches!(input, AIAgentInput::SummarizeConversation { .. }));
+        if let Some((provider, _, model_id)) =
+            crate::ai::agent_providers::lookup_byop(ctx, &request_params.model)
+        {
+            if is_summarization {
+                request_params.compaction_plan =
+                    crate::ai::agent_providers::chat_stream::prepare_byop_compaction(
+                        &request_params,
+                        &provider,
+                        &model_id,
+                        &compaction_cfg,
+                    );
+                if request_params.compaction_plan.is_none() {
+                    return self.complete_byop_blocked_request(
+                        request_input,
+                        conversation_id,
+                        request_params.model.clone(),
+                        is_queued_prompt,
+                        crate::t!("ai-error-context-too-large"),
+                        ctx,
+                    );
+                }
+            } else if allow_auto_compaction
+                && compaction_cfg.auto
+                && crate::ai::agent_providers::chat_stream::byop_request_needs_compaction(
+                    &request_params,
+                    &provider,
+                    &model_id,
+                )
+            {
+                // readiness 已持久化完成的工具结果；保留剩余原输入，摘要本身不重执行工具。
+                let summary_input =
+                    self.byop_compaction_request_input(conversation_id, Some(&request_input), ctx)?;
+                let result = self.send_request_input_with_compaction(
+                    summary_input,
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    ctx,
+                );
+                if let Ok((_, stream_id)) = &result {
+                    if self
+                        .in_flight_response_streams
+                        .has_active_stream_for_conversation(conversation_id, ctx)
+                    {
+                        let original_query = (!is_queued_prompt)
+                            .then(|| {
+                                request_input.all_inputs().find_map(|input| {
+                                    if let AIAgentInput::UserQuery { query, .. } = input {
+                                        Some(query.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .flatten();
+                        self.pending_byop_compaction_requests.insert(
+                            stream_id.clone(),
+                            PendingByopCompactionRequest {
+                                original_query,
+                                context_snapshot: self
+                                    .context_model
+                                    .as_ref(ctx)
+                                    .pending_context_snapshot(),
+                                request: PendingByopRequest {
+                                    allow_auto_compaction,
+                                    request_input,
+                                    query_metadata,
+                                    default_to_follow_up_on_success,
+                                    can_attempt_resume_on_error,
+                                    is_queued_prompt,
+                                },
+                            },
+                        );
+                        return result;
+                    }
+                }
+                // 无可发送的摘要计划时原请求也必须留在界面，不能仅显示一条失败摘要。
+                return self.complete_byop_blocked_request(
+                    request_input,
+                    conversation_id,
+                    request_params.model.clone(),
+                    is_queued_prompt,
+                    crate::t!("ai-error-context-too-large"),
+                    ctx,
+                );
+            }
+        }
+
         let server_conversation_token_for_identifiers =
             conversation_data.server_conversation_token.clone();
 
@@ -3114,7 +3359,8 @@ impl BlocklistAIController {
             ResponseStream::new(
                 request_params.clone(),
                 ai_identifiers,
-                can_attempt_resume_on_error,
+                can_attempt_resume_on_error && !is_summarization,
+                allow_auto_compaction,
                 ctx,
             )
         });
@@ -3181,7 +3427,7 @@ impl BlocklistAIController {
             ctx,
         );
 
-        if input_contains_user_query {
+        if input_contains_user_query && allow_auto_compaction {
             // Get the pending document ID before clearing context
             let pending_document_id = self.context_model.as_ref(ctx).pending_document_id();
 
@@ -3572,12 +3818,32 @@ impl BlocklistAIController {
                                 // Zap BYOP 本地会话压缩:在 stream finished 前拿 summarization 标志
                                 let summarize_overflow =
                                     response_stream.as_ref(ctx).summarization_overflow();
+                                let compaction_commit_input =
+                                    response_stream.as_ref(ctx).compaction_commit_input();
+                                let used_tokens = finished_event
+                                    .token_usage
+                                    .iter()
+                                    .map(|usage| {
+                                        (usage.total_input as usize)
+                                            .saturating_add(usage.output as usize)
+                                    })
+                                    .max()
+                                    .unwrap_or_default();
+                                if completed_successfully
+                                    && response_stream.as_ref(ctx).should_auto_compact(
+                                        used_tokens,
+                                        crate::ai::byop_compaction::CompactionConfig::from_settings(ctx).auto,
+                                    )
+                                {
+                                    self.byop_compaction_after_stream.insert(stream_id.clone());
+                                }
                                 self.handle_response_stream_finished(
                                     &stream_id,
                                     finished_event,
                                     conversation_id,
                                     did_input_contain_user_query,
                                     summarize_overflow,
+                                    compaction_commit_input,
                                     ctx,
                                 );
                             }
@@ -3648,6 +3914,10 @@ impl BlocklistAIController {
                 }
             }
             ResponseStreamEvent::AfterStreamFinished { cancellation } => {
+                let pending_compaction = self.pending_byop_compaction_requests.remove(&stream_id);
+                let compaction_committed =
+                    self.committed_byop_compaction_streams.remove(&stream_id);
+                let compact_after_stream = self.byop_compaction_after_stream.remove(&stream_id);
                 // Cancellations provide conversation_id (survives truncation); otherwise use dynamic lookup.
                 let conversation_id = match &cancellation {
                     Some(stream_cancellation) => stream_cancellation.conversation_id,
@@ -3698,6 +3968,7 @@ impl BlocklistAIController {
                     }
                 }
 
+                let has_new_actions = !actions_to_queue.is_empty();
                 if let Some(stream_cancellation) = &cancellation {
                     history_model.update(ctx, |history_model, ctx| {
                         history_model.mark_response_stream_cancelled(
@@ -3862,6 +4133,94 @@ impl BlocklistAIController {
                     }
                 });
                 ctx.unsubscribe_from_model(response_stream);
+                ctx.emit(BlocklistAIControllerEvent::FinishedReceivingOutput {
+                    stream_id: stream_id.clone(),
+                    conversation_id,
+                });
+
+                // 旧流及其会话映射已清理，后续请求不会取消刚完成的流或重复派发工具。
+                if let Some(PendingByopCompactionRequest {
+                    request: pending,
+                    original_query,
+                    context_snapshot,
+                }) = pending_compaction
+                {
+                    let has_pending_work = has_new_actions
+                        || is_any_exchange_unfinished
+                        || self
+                            .action_model
+                            .as_ref(ctx)
+                            .has_unfinished_actions_for_conversation(conversation_id)
+                        || self
+                            .in_flight_response_streams
+                            .has_active_stream_for_conversation(conversation_id, ctx);
+                    if can_continue_after_byop_compaction(
+                        compaction_committed,
+                        cancellation.is_some(),
+                        has_pending_work,
+                    ) {
+                        let backup_input = pending.request_input.clone();
+                        let result = self.send_request_input_with_compaction(
+                            pending.request_input,
+                            pending.query_metadata.clone(),
+                            pending.default_to_follow_up_on_success,
+                            false,
+                            true,
+                            false,
+                            ctx,
+                        );
+                        if result.is_err() {
+                            self.retain_input_after_failed_compaction(
+                                PendingByopRequest {
+                                    request_input: backup_input,
+                                    ..pending
+                                },
+                                None,
+                                ctx,
+                            );
+                        } else if let Some(query) = original_query {
+                            ctx.emit(BlocklistAIControllerEvent::SubmittedCompactedInput {
+                                query,
+                                context_snapshot,
+                            });
+                        }
+                    } else {
+                        self.retain_input_after_failed_compaction(
+                            pending,
+                            cancellation.as_ref().map(|cancelled| cancelled.reason),
+                            ctx,
+                        );
+                    }
+                } else if compact_after_stream
+                    && cancellation.is_none()
+                    && !has_new_actions
+                    && !is_any_exchange_unfinished
+                    && !self
+                        .action_model
+                        .as_ref(ctx)
+                        .has_unfinished_actions_for_conversation(conversation_id)
+                    && !self
+                        .in_flight_response_streams
+                        .has_active_stream_for_conversation(conversation_id, ctx)
+                {
+                    if let Ok(mut summary_input) =
+                        self.byop_compaction_request_input(conversation_id, None, ctx)
+                    {
+                        response_stream
+                            .as_ref(ctx)
+                            .preserve_request_models(&mut summary_input);
+                        // 普通回答已经结束，只为下次输入释放空间，不额外生成一次回答。
+                        let _ = self.send_request_input_with_compaction(
+                            summary_input,
+                            None,
+                            false,
+                            false,
+                            false,
+                            false,
+                            ctx,
+                        );
+                    }
+                }
 
                 if self.should_refresh_available_llms_on_stream_finish {
                     self.should_refresh_available_llms_on_stream_finish = false;
@@ -3869,10 +4228,6 @@ impl BlocklistAIController {
                         llm_preferences.refresh_authed_models(ctx);
                     });
                 }
-                ctx.emit(BlocklistAIControllerEvent::FinishedReceivingOutput {
-                    stream_id,
-                    conversation_id,
-                });
                 // Zap(Phase 3c A1):删除
                 // `AIRequestUsageModel::refresh_request_usage_async` 与
                 // `maybe_refresh_ai_overages` 调用。两者本质都是服务端计量同步 RPC，
@@ -3910,17 +4265,9 @@ impl BlocklistAIController {
         conversation_id: AIConversationId,
         did_request_contain_user_query: bool,
         summarize_overflow: Option<bool>,
+        compaction_commit_input: Option<(crate::ai::byop_compaction::CompactionPlan, String)>,
         ctx: &mut ModelContext<Self>,
     ) {
-        // Zap BYOP 本地会话压缩:在 token_usage move 进下面 closure 前先聚合,
-        // 用于 auto overflow 检查(后面 Done 分支用)。
-        let aggregate_token_count: usize = finished_event
-            .token_usage
-            .iter()
-            .map(|u| (u.total_input + u.output + u.input_cache_read + u.input_cache_write) as usize)
-            .max()
-            .unwrap_or(0);
-
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         history_model.update(ctx, |history_model, ctx| {
             // Update conversation cost and usage information before updating and
@@ -3941,57 +4288,56 @@ impl BlocklistAIController {
         match finished_event.reason {
             Some(warp_multi_agent_api::response_event::stream_finished::Reason::Done(_)) | None => {
                 // Zap BYOP 本地会话压缩 - 写回 summary
-                if let Some(overflow) = summarize_overflow {
-                    let compaction_cfg = crate::ai::byop_compaction::CompactionConfig::from_settings(ctx);
-                    history_model.update(ctx, |history_model, _ctx| {
+                let mut valid_summary = summarize_overflow.is_none();
+                if let Some(overflow) = summarize_overflow
+                    && let Some((plan, request_id)) = compaction_commit_input
+                {
+                    let committed = history_model.update(ctx, |history_model, _ctx| {
                         if let Some(convo) = history_model.conversation_mut(&conversation_id) {
-                            crate::ai::byop_compaction::commit::commit_summarization(
+                            return crate::ai::byop_compaction::commit::commit_summarization(
                                 convo,
+                                &plan,
+                                &request_id,
                                 overflow,
-                                &compaction_cfg,
                             );
                         }
+                        false
                     });
-                }
-                history_model.update(ctx, |history_model, ctx| {
-                    history_model.mark_response_stream_completed_successfully(
-                        stream_id,
-                        conversation_id,
-                        self.terminal_view_id,
-                        ctx,
-                    );
-                });
-
-                // Zap BYOP 本地会话压缩 - auto overflow 触发(对齐 opencode `processor.ts:395-403`)
-                // 仅在本流不是摘要本身时检查,防止递归。
-                if summarize_overflow.is_none() {
-                    let aggregate_count = aggregate_token_count;
-                    if aggregate_count > 0 {
-                        let cfg = crate::ai::byop_compaction::CompactionConfig::from_settings(ctx);
-                        let model_limit =
-                            crate::ai::byop_compaction::overflow::ModelLimit::FALLBACK;
-                        let counts = crate::ai::byop_compaction::overflow::TokenCounts {
-                            total: aggregate_count,
-                            ..Default::default()
-                        };
-                        if crate::ai::byop_compaction::is_overflow(&cfg, counts, model_limit) {
-                            log::info!(
-                                "[byop-compaction] auto overflow detected: tokens={aggregate_count} usable={}",
-                                crate::ai::byop_compaction::usable(&cfg, model_limit)
-                            );
-                            // 通过 SlashCommandRequest::Summarize 触发(与 /compact-and 同链路);
-                            // overflow=true → chat_stream 拼摘要请求时携带 overflow 标记,
-                            // commit_summarization 写回时也以 overflow=true 落 state(便于 UI 区分)。
-                            self.send_slash_command_request(
-                                crate::ai::blocklist::controller::SlashCommandRequest::Summarize {
-                                    prompt: None,
-                                    overflow: true,
-                                },
-                                ctx,
-                            );
-                        }
+                    if committed {
+                        valid_summary = true;
+                        self.committed_byop_compaction_streams.insert(stream_id.clone());
                     }
                 }
+                if !valid_summary {
+                    history_model.update(ctx, |history_model, ctx| {
+                        history_model.mark_response_stream_completed_with_error(
+                            RenderableAIError::Other {
+                                error_message: crate::t!("ai-error-compaction-invalid"),
+                                will_attempt_resume: false,
+                                waiting_for_network: false,
+                                is_user_error: false,
+                            },
+                            false,
+                            stream_id,
+                            conversation_id,
+                            self.terminal_view_id,
+                            ctx,
+                        );
+                    });
+                    return;
+                }
+                history_model.update(ctx, |history_model, ctx| {
+                    if self.pending_byop_compaction_requests.contains_key(stream_id) {
+                        history_model.mark_response_stream_completed_for_compaction(
+                            stream_id, conversation_id, self.terminal_view_id, ctx,
+                        );
+                    } else {
+                        history_model.mark_response_stream_completed_successfully(
+                            stream_id, conversation_id, self.terminal_view_id, ctx,
+                        );
+                    }
+                });
+
             }
             Some(warp_multi_agent_api::response_event::stream_finished::Reason::Other(_)) => {
                 let error_message = "Response stream finished unexpectedly (with finish reason `Other`).";
@@ -4329,3 +4675,7 @@ mod approval_mode_tests;
 #[cfg(test)]
 #[path = "controller_queued_query_tests.rs"]
 mod queued_query_tests;
+
+#[cfg(test)]
+#[path = "controller_compaction_tests.rs"]
+mod compaction_tests;

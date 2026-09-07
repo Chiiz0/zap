@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::api_error::is_context_window_exceeded_message;
 
 #[test]
 fn endpoint_preserves_version_path_and_query() {
@@ -35,6 +36,16 @@ fn http_error_extracts_structured_code_without_echoing_body() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn http_context_overflow_code_survives_display_conversion() {
+    let error = http_error(
+        http::StatusCode::BAD_GATEWAY,
+        r#"{"error":{"code":"context_window_exceeded","message":"Request too large"}}"#,
+    );
+
+    assert!(is_context_window_exceeded_message(&error.to_string()));
 }
 
 #[test]

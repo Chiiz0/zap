@@ -1,5 +1,6 @@
 use super::*;
 use crate::ai::agent_providers::responses::ResponseUsage;
+use crate::ai::api_error::is_context_window_exceeded_message;
 
 #[test]
 fn 原生事件流保留文本工具原始条目和序号() {
@@ -127,6 +128,63 @@ fn 非成功终止事件保留恢复元数据() {
     };
     assert_eq!(response_id.as_deref(), Some("resp_incomplete"));
     assert_eq!(message, "max_output_tokens");
+}
+
+#[test]
+fn 上下文超限结构化错误码在字符串转换后仍可识别() {
+    let event = ResponseStreamEvent::from_value(serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "id": "resp_failed",
+            "status": "failed",
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "Request too large"
+            }
+        }
+    }))
+    .expect("事件应合法");
+
+    assert!(is_context_window_exceeded_message(
+        &terminal_error(&event).to_string()
+    ));
+}
+
+#[test]
+fn 独立错误事件保留嵌套错误码和消息() {
+    let event = ResponseStreamEvent::from_value(serde_json::json!({
+        "type": "error",
+        "error": {
+            "code": "context_window_exceeded",
+            "message": "Request too large"
+        }
+    }))
+    .expect("事件应合法");
+    let error = terminal_error(&event);
+
+    assert!(is_context_window_exceeded_message(&error.to_string()));
+    let NativeResponsesStreamError::Terminal { code, message, .. } = error else {
+        panic!("应翻译成终止错误");
+    };
+    assert_eq!(code.as_deref(), Some("context_window_exceeded"));
+    assert_eq!(message, "Request too large");
+}
+
+#[test]
+fn 输出预算耗尽不能误判为输入上下文超限() {
+    let event = ResponseStreamEvent::from_value(serde_json::json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "resp_incomplete",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}
+        }
+    }))
+    .expect("事件应合法");
+
+    assert!(!is_context_window_exceeded_message(
+        &terminal_error(&event).to_string()
+    ));
 }
 
 #[test]

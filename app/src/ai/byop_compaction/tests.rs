@@ -9,6 +9,7 @@ use super::commit::commit_summarization;
 use super::config::CompactionConfig;
 use super::consts::*;
 use super::overflow::{ModelLimit, TokenCounts, is_overflow, usable};
+use super::plan::prepare_plan;
 use super::prompt::{SUMMARY_TEMPLATE, build_continue_message, build_prompt};
 use super::token::estimate;
 use crate::ai::agent::conversation::{AIConversation, AIConversationId};
@@ -611,24 +612,48 @@ fn conversation_with_messages(messages: Vec<api::Message>) -> AIConversation {
 
 #[test]
 fn commit_summarization_records_head_message_ids() {
-    let mut conversation = conversation_with_messages(vec![
+    let messages = vec![
         user_query("u1", "root", "r1", 1),
         agent_output("a1", "root", "r1", 2),
         user_query("u2", "root", "r2", 3),
         agent_output("a2", "root", "r2", 4),
         user_query("u3", "root", "r3", 5),
         agent_output("a3", "root", "r3", 6),
-    ]);
+    ];
     let cfg = CompactionConfig {
         tail_turns: 1,
         preserve_recent_tokens: Some(1_000),
         ..Default::default()
     };
 
-    assert!(commit_summarization(&mut conversation, false, &cfg));
+    let original = conversation_with_messages(messages.clone());
+    let plan = prepare_plan(
+        &original.all_linearized_messages(),
+        &original.compaction_state,
+        &cfg,
+        ModelLimit::FALLBACK,
+        |_| true,
+    )
+    .unwrap();
+    let mut completed_messages = messages;
+    completed_messages.push(agent_output("summary", "root", "summarize-request", 7));
+    let mut conversation = conversation_with_messages(completed_messages);
+
+    assert!(commit_summarization(
+        &mut conversation,
+        &plan,
+        "summarize-request",
+        false
+    ));
     let completed = conversation.compaction_state.completed().last().unwrap();
-    assert_eq!(completed.user_msg_id, "u3");
-    assert_eq!(completed.assistant_msg_id, "a3");
+    assert_eq!(completed.user_msg_id, "u1");
+    assert_eq!(completed.assistant_msg_id, "summary");
     assert_eq!(completed.tail_start_id.as_deref(), Some("u3"));
     assert_eq!(completed.head_message_ids, ["u1", "a1", "u2", "a2"]);
+    assert!(
+        !conversation
+            .compaction_state
+            .hidden_message_ids()
+            .contains("u3")
+    );
 }

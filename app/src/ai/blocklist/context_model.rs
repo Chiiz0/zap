@@ -297,10 +297,22 @@ pub struct PendingAttachmentSummary {
 }
 
 /// A pending attachment — either an image (base64 in memory) or a file (path reference).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingAttachment {
     Image(ImageContext),
     File(PendingFile),
+}
+
+/// 自动摘要期间用于确认草稿上下文是否仍是原输入，防止续发时清除后来添加的附件。
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingContextSnapshot {
+    block_ids: HashSet<BlockId>,
+    selected_text: Option<String>,
+    attachments: Vec<PendingAttachment>,
+    diff_hunks: HashMap<String, AIAgentAttachment>,
+    at_context: HashMap<String, AIAgentAttachment>,
+    document_id: Option<AIDocumentId>,
+    auto_attached_blocks: Vec<BlockId>,
 }
 
 impl PendingAttachment {
@@ -506,6 +518,18 @@ impl BlocklistAIContextModel {
         self.clear_at_context_attachments();
         self.set_pending_document(None, ctx);
         self.auto_attached_agent_view_user_block_ids.clear();
+    }
+
+    pub fn pending_context_snapshot(&self) -> PendingContextSnapshot {
+        PendingContextSnapshot {
+            block_ids: self.pending_context_block_ids.clone(),
+            selected_text: self.pending_context_selected_text.clone(),
+            attachments: self.pending_attachments.clone(),
+            diff_hunks: self.pending_inline_diff_hunk_attachments.clone(),
+            at_context: self.pending_inline_at_context_attachments.clone(),
+            document_id: self.pending_document_id,
+            auto_attached_blocks: self.auto_attached_agent_view_user_block_ids.clone(),
+        }
     }
 
     /// Returns `true` if the next AI query has any context that should force the input to be

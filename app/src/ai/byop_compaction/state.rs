@@ -44,6 +44,9 @@ pub struct MessageMarker {
 pub struct CompletedCompaction {
     pub user_msg_id: String,
     pub assistant_msg_id: String,
+    /// 本次摘要流产生的正文和思考载体，全部隐藏，避免原始 Responses 状态再次回放。
+    #[serde(default)]
+    pub summary_message_ids: Vec<String>,
     /// 本次摘要覆盖的 head 区 message ids,投影普通请求时全部隐藏。
     #[serde(default)]
     pub head_message_ids: Vec<String>,
@@ -82,7 +85,7 @@ impl Default for CompactionState {
 }
 
 impl CompactionState {
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u32 = 3;
     fn current_version() -> u32 {
         Self::VERSION
     }
@@ -113,6 +116,9 @@ impl CompactionState {
             });
         });
         self.upsert_marker(c.assistant_msg_id.clone(), |m| m.is_summary = true);
+        for message_id in &c.summary_message_ids {
+            self.upsert_marker(message_id.clone(), |m| m.is_summary = true);
+        }
         self.completed.push(c);
     }
 
@@ -143,6 +149,7 @@ impl CompactionState {
             out.extend(c.head_message_ids.iter().cloned());
             out.insert(c.user_msg_id.clone());
             out.insert(c.assistant_msg_id.clone());
+            out.extend(c.summary_message_ids.iter().cloned());
         }
         out
     }
@@ -162,6 +169,7 @@ mod state_tests {
         CompletedCompaction {
             user_msg_id: uid.to_string(),
             assistant_msg_id: aid.to_string(),
+            summary_message_ids: vec![aid.to_string()],
             head_message_ids: Vec::new(),
             tail_start_id: None,
             summary_text: Some(format!("summary-{aid}")),

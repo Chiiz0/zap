@@ -77,6 +77,23 @@ impl From<serde_json::Error> for AIApiError {
 }
 
 impl AIApiError {
+    /// 兼容网关可能把上下文超限包装成 502 或流错误，不能仅按 HTTP 状态重试。
+    pub fn is_context_window_exceeded(&self) -> bool {
+        match self {
+            Self::ErrorStatus(_, message) | Self::ProviderProtocol(message) => {
+                is_context_window_exceeded_message(message)
+            }
+            Self::Other(error) | Self::Stream { source: error, .. } => error
+                .chain()
+                .any(|source| is_context_window_exceeded_message(&source.to_string())),
+            Self::QuotaLimit
+            | Self::ServerOverloaded
+            | Self::Transport(_)
+            | Self::Deserialization(_)
+            | Self::NoContextFound => false,
+        }
+    }
+
     fn from_response_error(err: reqwest::Error, headers: &::http::HeaderMap) -> Self {
         if err.status() == Some(http::StatusCode::TOO_MANY_REQUESTS) {
             return Self::error_for_429(headers);
@@ -149,6 +166,10 @@ impl AIApiError {
     }
 
     pub fn is_retryable(&self) -> bool {
+        if self.is_context_window_exceeded() {
+            return false;
+        }
+
         fn is_retryable_status(status: http::StatusCode) -> bool {
             !status.is_client_error()
                 || status == http::StatusCode::REQUEST_TIMEOUT
@@ -180,6 +201,10 @@ mod tests;
 
 impl ErrorExt for AIApiError {
     fn is_actionable(&self) -> bool {
+        if self.is_context_window_exceeded() {
+            return false;
+        }
+
         match self {
             AIApiError::Deserialization(_) => true,
             AIApiError::Transport(error) => error.is_actionable(),
@@ -192,6 +217,22 @@ impl ErrorExt for AIApiError {
             | AIApiError::ProviderProtocol(_) => false,
         }
     }
+}
+
+/// 只接受明确的超限错误码或输入超限描述，避免把输出 token 耗尽和普通 502 误分类。
+pub(crate) fn is_context_window_exceeded_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message
+        .split(|c| !matches!(c, 'a'..='z' | '0'..='9' | '_'))
+        .any(|part| matches!(part, "context_window_exceeded" | "context_length_exceeded"))
+        || [
+            "input exceeds the context window",
+            "input exceeded the context window",
+            "input exceeds context window",
+            "input exceeded context window",
+        ]
+        .iter()
+        .any(|phrase| message.contains(phrase))
 }
 
 register_error!(AIApiError);

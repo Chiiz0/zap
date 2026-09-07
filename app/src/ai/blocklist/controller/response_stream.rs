@@ -242,6 +242,10 @@ pub struct ResponseStream {
     /// and `can_attempt_resume_on_error` is true.
     should_resume_conversation_after_stream_finished: bool,
 
+    /// 保存发起本轮请求时的实际 BYOP 窗口，避免结束时误读后来切换的模型。
+    byop_context_window: Option<Option<u32>>,
+    allow_auto_compaction: bool,
+
     /// Unique, internal id for the current request.
     ///
     /// This ensures that the model never emits events for a request that was already cancelled (or
@@ -271,6 +275,8 @@ impl ResponseStream {
             can_attempt_resume_on_error: false,
             pending_title_generation: None,
             should_resume_conversation_after_stream_finished: false,
+            byop_context_window: None,
+            allow_auto_compaction: false,
             current_request_id: Some(Uuid::new_v4()),
         }
     }
@@ -279,6 +285,7 @@ impl ResponseStream {
         params: api::RequestParams,
         ai_identifiers: AIIdentifiers,
         can_attempt_resume_on_error: bool,
+        allow_auto_compaction: bool,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let (cancellation_tx, cancellation_rx) = oneshot::channel();
@@ -290,6 +297,14 @@ impl ResponseStream {
         // 则在 spawn 前从 ctx 中取出 (provider, api_key, model_id, root_task_id),
         // 走自定义 chat completions。否则走 warp 自家 multi-agent 端点(原有路径)。
         let byop_dispatch = byop_dispatch_info(&params, &ai_identifiers, ctx);
+        let byop_context_window = byop_dispatch.as_ref().map(|byop| {
+            params
+                .context_window_limit
+                .filter(|limit| *limit > 0)
+                .into_iter()
+                .chain(byop.context_window)
+                .min()
+        });
         let pending_title_generation = byop_dispatch
             .as_ref()
             .and_then(|byop| pending_title_generation_from_byop(&params, byop));
@@ -338,6 +353,8 @@ impl ResponseStream {
             can_attempt_resume_on_error,
             pending_title_generation,
             should_resume_conversation_after_stream_finished: false,
+            byop_context_window,
+            allow_auto_compaction,
             current_request_id: Some(request_id),
         }
     }
@@ -348,6 +365,32 @@ impl ResponseStream {
 
     pub fn id(&self) -> &ResponseStreamId {
         &self.id
+    }
+
+    pub(super) fn compaction_commit_input(
+        &self,
+    ) -> Option<(crate::ai::byop_compaction::CompactionPlan, String)> {
+        Some((
+            self.params.compaction_plan.clone()?,
+            self.ai_identifiers.server_output_id.as_ref()?.to_string(),
+        ))
+    }
+
+    pub(super) fn should_auto_compact(&self, tokens: usize, auto_enabled: bool) -> bool {
+        self.allow_auto_compaction
+            && auto_enabled
+            && self.summarization_overflow().is_none()
+            && self.byop_context_window.is_some_and(|window| {
+                let budget = crate::ai::agent_providers::request_budget::input_token_budget(window);
+                tokens > 0 && tokens >= budget.saturating_mul(4) / 5
+            })
+    }
+
+    pub(super) fn preserve_request_models(&self, input: &mut super::RequestInput) {
+        input.model_id = self.params.model.clone();
+        input.coding_model_id = self.params.coding_model.clone();
+        input.cli_agent_model_id = self.params.cli_agent_model.clone();
+        input.computer_use_model_id = self.params.computer_use_model.clone();
     }
 
     pub fn is_lrc_tag_in_request(&self) -> bool {
@@ -681,3 +724,7 @@ async fn byop_required_response_stream(
     .take_until(cancellation_rx);
     Ok(Box::pin(error_stream))
 }
+
+#[cfg(test)]
+#[path = "response_stream_compaction_tests.rs"]
+mod compaction_tests;

@@ -55,6 +55,7 @@ jobs:
           git --version
           rustc --version
           cargo --version
+          cargo nextest --version
           cmake --version
           protoc --version
 
@@ -62,9 +63,11 @@ jobs:
         shell: bash
         run: cargo check -p warp --lib
 
-      - name: Test Responses integration
+      - name: Test BYOP context recovery and Responses integration
         shell: bash
-        run: cargo test -p warp --lib responses -- --nocapture
+        run: >-
+          cargo nextest run --no-fail-fast -p warp --lib
+          -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::tests) | test(i18n::tests)'
 
       - name: Test rust-genai
         shell: bash
@@ -128,6 +131,7 @@ jobs:
           git --version
           rustc --version
           cargo --version
+          cargo nextest --version
           cmake --version
           protoc --version
           & $env:RUSTC_WRAPPER --version
@@ -147,9 +151,11 @@ jobs:
           .\script\windows\test_pwsh_ssh_worker.ps1
           -WorkerPath "$env:CARGO_TARGET_DIR\debug\infinishell-ssh.exe"
 
-      - name: Test Responses integration
+      - name: Test BYOP context recovery and Responses integration
         shell: pwsh
-        run: cargo test -p warp --lib responses -- --nocapture
+        run: >-
+          cargo nextest run --no-fail-fast -p warp --lib
+          -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::tests) | test(i18n::tests)'
 
       - name: Test rust-genai
         shell: pwsh

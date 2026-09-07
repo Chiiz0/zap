@@ -136,7 +136,7 @@ git push origin HEAD:refs/heads/ci/responses-api
 
 ```text
 cargo check -p warp --lib
-cargo test -p warp --lib responses -- --nocapture
+cargo nextest run --no-fail-fast -p warp --lib -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::tests) | test(i18n::tests)'
 cargo test --manifest-path lib/rust-genai/Cargo.toml --lib
 ```
 

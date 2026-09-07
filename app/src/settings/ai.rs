@@ -1453,7 +1453,7 @@ pub struct AgentProviderModel {
     pub id: String,
 
     /// 上下文窗口(tokens)。来源:用户填或 models.dev 自动带入。
-    /// 0 表示未知 — chat_stream 退化到不做主动截断,完全交给上游服务报错。
+    /// 0 表示未知 — 请求使用默认安全预算，仍限制单条和累计工具输出。
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub context_window: u32,
 

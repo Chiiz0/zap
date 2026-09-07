@@ -224,7 +224,8 @@ fn responses混合本地与审批工具结果保持就绪() {
         AgentProviderApiType::OpenAiResp,
         attachment_caps::AttachmentCaps::default(),
     )
-    .expect("Responses 原始条目和工具结果应形成合法请求");
+    .expect("Responses 原始条目和工具结果应形成合法请求")
+    .0;
     let result_ids = request
         .messages
         .iter()
@@ -340,7 +341,8 @@ fn responses状态续接包含已持久化的工具输出() {
         AgentProviderApiType::OpenAiResp,
         attachment_caps::AttachmentCaps::default(),
     )
-    .expect("状态续接请求应合法");
+    .expect("状态续接请求应合法")
+    .0;
 
     assert_eq!(
         request

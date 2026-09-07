@@ -165,22 +165,15 @@ impl<'a> MessageRef for WarpMessageView<'a> {
     }
 }
 
-/// 把一组 messages 投影成 `Vec<WarpMessageView>`,按 timestamp 升序排序 —
-/// 与 [`crate::ai::agent_providers::chat_stream::build_chat_request`] 的排序保持一致。
+/// 保持调用方传入的 DFS 顺序，选择算法的下标必须与真正发送的消息序列一致。
 pub fn project<'a>(
     messages: &'a [&'a api::Message],
     state: &'a CompactionState,
     tool_names: &'a ToolNameLookup,
 ) -> Vec<WarpMessageView<'a>> {
-    let mut sorted: Vec<&api::Message> = messages.to_vec();
-    sorted.sort_by_key(|m| {
-        m.timestamp
-            .as_ref()
-            .map(|ts| (ts.seconds, ts.nanos))
-            .unwrap_or((0, 0))
-    });
-    sorted
-        .into_iter()
+    messages
+        .iter()
+        .copied()
         .map(|msg| WarpMessageView {
             msg,
             state,

@@ -2458,6 +2458,17 @@ impl AIConversation {
         terminal_surface_id: EntityId,
         ctx: &mut ModelContext<BlocklistAIHistoryModel>,
     ) -> Result<(), UpdateConversationError> {
+        self.mark_request_completed_with_continuation(stream_id, terminal_surface_id, false, ctx)
+    }
+
+    /// 内部摘要之后还有待发输入时，只结束摘要 exchange，保持会话进行中以防抢先发送队列。
+    pub(crate) fn mark_request_completed_with_continuation(
+        &mut self,
+        stream_id: &ResponseStreamId,
+        terminal_surface_id: EntityId,
+        keep_in_progress: bool,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<(), UpdateConversationError> {
         let Some(new_exchanges) = self.added_exchanges_by_response.get(stream_id).cloned() else {
             report_error!("No pending request info for completed request.");
             return Err(UpdateConversationError::NoPendingRequest);
@@ -2499,7 +2510,7 @@ impl AIConversation {
         }
         self.write_updated_conversation_state(ctx);
 
-        if !has_new_actions {
+        if !has_new_actions && !keep_in_progress {
             // Update conversation-level status to success if the output has no actions.
             self.update_status(ConversationStatus::Success, terminal_surface_id, ctx);
         }

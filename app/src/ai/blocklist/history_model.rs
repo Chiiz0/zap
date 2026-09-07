@@ -1924,6 +1924,24 @@ impl BlocklistAIHistoryModel {
         }
     }
 
+    pub(crate) fn mark_response_stream_completed_for_compaction(
+        &mut self,
+        stream_id: &ResponseStreamId,
+        conversation_id: AIConversationId,
+        terminal_surface_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(conversation) = self.conversations_by_id.get_mut(&conversation_id) else {
+            return;
+        };
+        if conversation
+            .mark_request_completed_with_continuation(stream_id, terminal_surface_id, true, ctx)
+            .is_err()
+        {
+            log::warn!("[byop-compaction] 无法完成内部摘要 exchange");
+        }
+    }
+
     pub fn set_exchange_time_to_first_token(
         &mut self,
         conversation_id: AIConversationId,

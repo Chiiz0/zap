@@ -32,7 +32,7 @@ pub enum ResponsesClientError {
     InvalidRequest(#[from] ResponseRequestValidationError),
     #[error("Responses HTTP 传输失败")]
     Transport(#[source] reqwest::Error),
-    #[error("Responses HTTP {status}: {message}")]
+    #[error("Responses HTTP {status}: {message} (code={code:?})")]
     Http {
         status: http::StatusCode,
         code: Option<String>,

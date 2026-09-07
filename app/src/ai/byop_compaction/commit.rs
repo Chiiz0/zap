@@ -3,95 +3,93 @@
 //!
 //! 本模块独立于 controller,作为可单元测试的 helper(虽然真实调用站点在 controller.rs)。
 
+use std::collections::HashSet;
+
 use warp_multi_agent_api as api;
 
-use super::algorithm::{MessageRef, prune_decisions, select};
+use super::algorithm::prune_decisions;
 use super::config::CompactionConfig;
 use super::message_view::{build_tool_name_lookup, project};
-use super::overflow::ModelLimit;
+use super::plan::CompactionPlan;
 use super::state::CompletedCompaction;
 use crate::ai::agent::conversation::AIConversation;
 
-/// 从 conversation 的 root task 倒序找最后一条 `Message::AgentOutput` —
-/// 它就是模型刚 emit 的摘要文本。
-///
-/// `user_msg_id` 选最后一条 AgentOutput 之前最近一条真实 UserQuery 的 id;
-/// 没有时合成一个独立 uuid(只用作 marker key,build_chat_request 的 hidden
-/// 投影不会命中真实 message)。
+/// 只提交这次成功请求产生的非空摘要，覆盖范围完全由发送前的计划决定。
+/// 空响应、旧回答、源历史变化和重复完成事件都不得改变压缩状态。
 pub fn commit_summarization(
     conversation: &mut AIConversation,
+    plan: &CompactionPlan,
+    request_id: &str,
     overflow: bool,
-    cfg: &CompactionConfig,
 ) -> bool {
-    // 用 conversation 已有的 linearized messages accessor — 跨所有 task 已按时间序合并
-    let mut all_msgs: Vec<&api::Message> = conversation.all_linearized_messages();
-    all_msgs.sort_by_key(|m| {
-        m.timestamp
-            .as_ref()
-            .map(|ts| (ts.seconds, ts.nanos))
-            .unwrap_or((0, 0))
-    });
-
-    let last_agent_output: Option<(String, String)> = all_msgs.iter().rev().find_map(|m| {
-        let inner = m.message.as_ref()?;
-        match inner {
-            api::message::Message::AgentOutput(a) => Some((m.id.clone(), a.text.clone())),
-            _ => None,
+    let mut all_msgs = conversation.all_linearized_messages();
+    // 与请求的 DFS 线性化使用相同的用户消息去重规则。
+    let mut seen_user_queries = HashSet::new();
+    all_msgs.retain(|message| {
+        if let Some(api::message::Message::UserQuery(query)) = &message.message {
+            message.request_id.is_empty()
+                || seen_user_queries.insert((&message.request_id, &query.query))
+        } else {
+            true
         }
     });
-
-    let Some((assistant_id, summary_text)) = last_agent_output else {
-        log::warn!("[byop-compaction] commit: no AgentOutput found — nothing to commit");
+    if request_id.is_empty() || !plan.is_current(&all_msgs, &conversation.compaction_state) {
+        return false;
+    }
+    let produced: Vec<&api::Message> = all_msgs
+        .iter()
+        .copied()
+        .filter(|message| message.request_id == request_id && plan.is_new_message(&message.id))
+        .collect();
+    if produced.iter().any(|message| {
+        matches!(
+            message.message,
+            Some(api::message::Message::ToolCall(_) | api::message::Message::ToolCallResult(_))
+        )
+    }) {
+        return false;
+    }
+    let outputs: Vec<(&str, &str)> = produced
+        .iter()
+        .filter_map(|message| {
+            if let Some(api::message::Message::AgentOutput(output)) = &message.message {
+                (!output.text.trim().is_empty())
+                    .then_some((message.id.as_str(), output.text.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let Some((assistant_id, _)) = outputs.last() else {
         return false;
     };
-
-    let assistant_id_str: &str = &assistant_id;
-    let assistant_pos = all_msgs
+    let summary_text = outputs
         .iter()
-        .position(|m| m.id.as_str() == assistant_id_str);
-    let user_msg_id: String = assistant_pos
-        .and_then(|pos| {
-            all_msgs[..pos]
-                .iter()
-                .rev()
-                .find_map(|m| match m.message.as_ref() {
-                    Some(api::message::Message::UserQuery(_)) => Some(m.id.clone()),
-                    _ => None,
-                })
-        })
-        .unwrap_or_else(|| format!("compaction-trigger-{}", uuid::Uuid::new_v4()));
-
-    let tool_names = build_tool_name_lookup(all_msgs.iter().copied());
-    let state_snapshot = conversation.compaction_state.clone();
-    let views = project(&all_msgs, &state_snapshot, &tool_names);
-    let select_result = select(&views, cfg, ModelLimit::FALLBACK, |slice| {
-        slice.iter().map(MessageRef::estimate_size).sum()
-    });
-    let head_message_ids = all_msgs[..select_result.head_end]
-        .iter()
-        .map(|m| m.id.clone())
-        .collect::<Vec<_>>();
-    let auto = overflow;
-    let summary_len = summary_text.len();
+        .map(|(_, text)| *text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let completed = CompletedCompaction {
-        user_msg_id: user_msg_id.clone(),
-        assistant_msg_id: assistant_id.clone(),
-        head_message_ids,
-        tail_start_id: select_result.tail_start_id,
+        user_msg_id: plan.anchor_message_id.clone(),
+        assistant_msg_id: (*assistant_id).to_owned(),
+        summary_message_ids: produced
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.message,
+                    Some(
+                        api::message::Message::AgentOutput(_)
+                            | api::message::Message::AgentReasoning(_)
+                    )
+                )
+            })
+            .map(|message| message.id.clone())
+            .collect(),
+        head_message_ids: plan.head_message_ids.clone(),
+        tail_start_id: plan.tail_start_id.clone(),
         summary_text: Some(summary_text),
-        auto,
+        auto: overflow,
         overflow,
     };
-    log::info!(
-        "[byop-compaction] commit: assistant_msg={} user_msg={} summary_len={} auto={} overflow={} head_count={} tail_start={:?}",
-        assistant_id,
-        user_msg_id,
-        summary_len,
-        auto,
-        overflow,
-        completed.head_message_ids.len(),
-        completed.tail_start_id,
-    );
     conversation.compaction_state.push_completed(completed);
     true
 }

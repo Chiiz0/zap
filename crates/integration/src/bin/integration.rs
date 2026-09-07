@@ -196,6 +196,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_custom_ps1_expansion_bash);
     register_test!(test_bash_honor_ps1_expands_dynamic_prompt_once);
     register_test!(test_mcp_error_text_layout_in_english_and_chinese);
+    register_test!(test_context_error_text_layout_in_english_and_chinese);
     register_test!(test_mcp_error_cards_visual_preview);
     register_test!(test_completions_with_autocd);
     register_test!(test_auto_title);

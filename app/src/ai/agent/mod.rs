@@ -824,6 +824,10 @@ pub enum TransientNetworkErrorKind {
 
 impl From<&Arc<AIApiError>> for RenderableAIError {
     fn from(value: &Arc<AIApiError>) -> Self {
+        if value.is_context_window_exceeded() {
+            return Self::ContextWindowExceeded(crate::t!("ai-error-context-too-large"));
+        }
+
         // Non-retryable 4xx errors (403 fraud block, 400 model/plan restriction, etc.)
         // are user-originating — map them to a user error so the task reaches FAILED
         // state rather than ERROR state.

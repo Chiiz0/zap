@@ -29,7 +29,7 @@ pub enum NativeResponsesStreamError {
     Client(#[from] ResponsesClientError),
     #[error(transparent)]
     WebSocket(#[from] ResponsesWebSocketError),
-    #[error("Responses {event}: {message}")]
+    #[error("Responses {event}: {message} (code={code:?})")]
     Terminal {
         event: String,
         response_id: Option<String>,
@@ -644,6 +644,13 @@ fn terminal_error(event: &ResponseStreamEvent) -> NativeResponsesStreamError {
         .or_else(|| {
             event
                 .raw
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            event
+                .raw
                 .get("message")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
@@ -657,7 +664,13 @@ fn terminal_error(event: &ResponseStreamEvent) -> NativeResponsesStreamError {
             .unwrap_or("error")
             .to_owned(),
         response_id,
-        code: api_error.and_then(|error| error.code.clone()),
+        // SSE/WS 的独立 error 事件没有 response object，但错误码仍用于决定是否重试。
+        code: api_error.and_then(|error| error.code.clone()).or_else(|| {
+            ["/error/code", "/code"]
+                .into_iter()
+                .find_map(|pointer| event.raw.pointer(pointer).and_then(Value::as_str))
+                .map(str::to_owned)
+        }),
         message,
     }
 }
