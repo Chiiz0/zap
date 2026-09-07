@@ -19,6 +19,8 @@ use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use warp_errors::report_error;
 use wgpu::rwh::HasDisplayHandle;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use wgpu::rwh::{HasWindowHandle, RawWindowHandle};
 use wgpu::{AdapterInfo, CompositeAlphaMode};
 #[cfg(windows)]
 use windows::Win32::Graphics::Dwm;
@@ -75,7 +77,7 @@ pub(crate) struct WindowManager {
     os_window_manager_name: OnceCell<Option<String>>,
     /// This is a client for talking to the Xorg server directly instead of through winit.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    x11_manager: Option<x11::X11Manager>,
+    x11_manager: Option<Rc<x11::X11Manager>>,
     display_handle: OwnedDisplayHandle,
 }
 
@@ -129,7 +131,7 @@ impl WindowManager {
             os_window_manager_name: Default::default(),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             x11_manager: match x11::X11Manager::new() {
-                Ok(x11_manager) => Some(x11_manager),
+                Ok(x11_manager) => Some(Rc::new(x11_manager)),
                 Err(err) => {
                     report_error!(err.context("error creating connection to Xorg server"));
                     None
@@ -170,8 +172,14 @@ impl platform::WindowManager for WindowManager {
             window_id,
             window_options,
         })?;
-        self.windows
-            .insert(window_id, Rc::new(super::window::Window::new(callbacks)));
+        self.windows.insert(
+            window_id,
+            Rc::new(super::window::Window::new(
+                callbacks,
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                self.x11_manager.clone(),
+            )),
+        );
         self.window_ordering
             .lock()
             .note_window_created(window_id, style);
@@ -458,7 +466,7 @@ impl platform::WindowManager for WindowManager {
             .get_or_init(|| {
                 cfg_if::cfg_if! {
                     if #[cfg(any(target_os = "linux", target_os = "freebsd"))] {
-                        get_os_window_manager_name_internal(self.x11_manager.as_ref())
+                        get_os_window_manager_name_internal(self.x11_manager.as_deref())
                     } else {
                         None
                     }
@@ -731,6 +739,8 @@ type FrameCaptureCallback = Box<dyn FnOnce(platform::CapturedFrame) + Send + 'st
 
 pub(super) struct Window {
     pub(super) callbacks: WindowCallbacks,
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    x11_manager: Option<Rc<x11::X11Manager>>,
     inner: RefCell<Option<Inner>>,
     scene: RefCell<Option<Rc<Scene>>>,
     /// The height, in logical pixels, of the "titlebar region" at the top of the window.
@@ -743,9 +753,16 @@ pub(super) struct Window {
 }
 
 impl Window {
-    pub fn new(callbacks: WindowCallbacks) -> Self {
+    fn new(
+        callbacks: WindowCallbacks,
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))] x11_manager: Option<
+            Rc<x11::X11Manager>,
+        >,
+    ) -> Self {
         Self {
             callbacks,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            x11_manager,
             inner: Default::default(),
             scene: Default::default(),
             titlebar_height: Cell::new(DEFAULT_TITLEBAR_HEIGHT),
@@ -1145,18 +1162,35 @@ impl Window {
             UserAttentionType::Informational
         };
 
-        if let Some(inner) = self.inner.borrow().as_ref() {
-            inner
-                .window
-                .request_user_attention(Some(user_attention_urgency));
-        };
+        self.set_user_attention(Some(user_attention_urgency));
     }
 
     /// Stops requesting user attention for the current window. If window has not previously requested user attention,
     /// this is a noop.
     pub fn stop_requesting_user_attention(&self) {
+        self.set_user_attention(None);
+    }
+
+    fn set_user_attention(&self, urgency: Option<UserAttentionType>) {
         if let Some(inner) = self.inner.borrow().as_ref() {
-            inner.window.request_user_attention(None);
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            {
+                let x11_window = match inner.window.window_handle().map(|handle| handle.as_raw()) {
+                    Ok(RawWindowHandle::Xlib(handle)) => Some(handle.window as u32),
+                    Ok(RawWindowHandle::Xcb(handle)) => Some(handle.window.get()),
+                    Ok(_) => None,
+                    Err(_) => return,
+                };
+                if let Some(window) = x11_window {
+                    // 本地 winit 分支仍会在 X11 断连时 panic；直接复用已有连接，
+                    // 即使连接不可用也不回退到该路径。Wayland 保持 winit 的行为。
+                    if let Some(manager) = &self.x11_manager {
+                        manager.set_user_attention(window, urgency.is_some());
+                    }
+                    return;
+                }
+            }
+            inner.window.request_user_attention(urgency);
         };
     }
 

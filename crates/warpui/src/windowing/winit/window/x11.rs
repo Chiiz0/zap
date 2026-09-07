@@ -3,6 +3,7 @@ use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::vec2f;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use x11rb::connection::Connection;
+use x11rb::properties::WmHints;
 use x11rb::protocol::randr::{self, MonitorInfo};
 use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt};
 use x11rb::rust_connection::RustConnection;
@@ -41,6 +42,21 @@ pub(super) struct X11Manager {
 }
 
 impl X11Manager {
+    /// 提醒是尽力而为的操作；窗口销毁或 X11 断连不能让应用崩溃。
+    pub(super) fn set_user_attention(&self, window: xproto::Window, urgent: bool) {
+        let mut hints = WmHints::get(&self.conn, window)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .flatten()
+            .unwrap_or_default();
+        hints.urgent = urgent;
+        if let Ok(cookie) = hints.set(&self.conn, window) {
+            cookie.ignore_error();
+            // 此连接独立于 winit 事件循环，必须主动发送已缓冲的请求。
+            let _ = self.conn.flush();
+        }
+    }
+
     pub(super) fn new() -> anyhow::Result<Self> {
         let (conn, screen_index) = RustConnection::connect(None)?;
 
@@ -240,3 +256,7 @@ pub(super) fn physical_bounds_to_rect(bounds: &PhysicalMonitorBounds, scale_fact
 fn rect_area(rect: RectF) -> f32 {
     rect.width() * rect.height()
 }
+
+#[cfg(test)]
+#[path = "x11_tests.rs"]
+mod tests;
