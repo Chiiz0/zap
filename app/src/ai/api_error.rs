@@ -2,6 +2,7 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use warp_errors::{AnyhowErrorExt, ErrorExt, register_error};
 
+use crate::ai::byop_compaction::state::CompactionPersistenceError;
 use crate::ai::byop_readiness::BlockedByopReadinessError;
 
 const INFINISHELL_ERROR_CODE_HEADER: &str = "X-InfiniShell-Error-Code";
@@ -190,7 +191,10 @@ impl AIApiError {
             | AIApiError::NoContextFound
             | AIApiError::Stream { .. } => true,
             AIApiError::ProviderProtocol(_) => false,
-            AIApiError::Other(error) => error.downcast_ref::<BlockedByopReadinessError>().is_none(),
+            AIApiError::Other(error) => {
+                error.downcast_ref::<BlockedByopReadinessError>().is_none()
+                    && !error.is::<CompactionPersistenceError>()
+            }
         }
     }
 }

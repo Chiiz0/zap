@@ -160,6 +160,8 @@ pub struct RequestParams {
     pub byop_conversation_id: Option<AIConversationId>,
     /// Zap BYOP 专用:单次请求内的非持久诊断关联 id。
     pub byop_readiness_attempt_id: Option<String>,
+    /// 摘要恢复检查点预先分配的请求 ID，用于重启时精确判断原输入是否已经入库。
+    pub byop_recovery_request_id: Option<String>,
     /// The conversation ID of the parent agent that spawned this child agent, if any.
     pub parent_agent_id: Option<String>,
     /// The display name for this agent (e.g. "Agent 1"), assigned by the orchestrator.
@@ -280,6 +282,7 @@ impl RequestParams {
             supported_tools_override: None,
             byop_conversation_id: Some(AIConversationId::new()),
             byop_readiness_attempt_id: None,
+            byop_recovery_request_id: None,
             parent_agent_id: None,
             agent_name: None,
             lrc_command_id: None,
@@ -500,6 +503,7 @@ impl RequestParams {
             supported_tools_override: request_input.supported_tools_override.clone(),
             byop_conversation_id: Some(conversation.id),
             byop_readiness_attempt_id: None,
+            byop_recovery_request_id: None,
             parent_agent_id: None,
             agent_name: None,
             lrc_command_id: None,

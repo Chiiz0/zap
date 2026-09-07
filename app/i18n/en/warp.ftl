@@ -5307,6 +5307,7 @@ ai-error-request-failed = Request failed with error: { $error }
 ai-error-quota-limit-reached = Quota limit reached.
 ai-error-context-window-exceeded = Context window exceeded: { $message }
 ai-error-context-too-large = The request context is too large. Automatic retries have stopped. Compact the conversation or reduce attached content, then try again.
+ai-error-compaction-save-failed = Your pending request could not be saved. Check disk space and write permissions, then try again.
 ai-error-compaction-invalid = The model did not return a complete conversation summary. Your original history is preserved. Try compacting the conversation again or switch models.
 ai-error-invalid-api-key = Invalid API key for { $provider }
 ai-error-bedrock-credentials-invalid = AWS Bedrock credentials for { $model } have expired or are invalid.

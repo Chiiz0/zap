@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+use std::sync::mpsc::TrySendError;
 
 use ai::agent::orchestration_config::{OrchestrationConfig, OrchestrationConfigStatus};
 use ai::document::AIDocumentId;
 use ai::skills::SkillPathOrigin;
 use anyhow::Context as _;
 use chrono::{DateTime, Local, TimeZone};
+use futures::channel::oneshot;
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -65,11 +67,11 @@ use crate::ai::llms::LLMPreferences;
 use crate::ai::skills::SkillDescriptor;
 use crate::code_review::CodeReviewTelemetryEvent;
 use crate::notebooks::NotebookId;
-use crate::persistence::ModelEvent;
 use crate::persistence::model::{
     AgentConversationData, ContextWindowSegment, ConversationUsageMetadata, ModelTokenUsage,
     PersistedAutoexecuteMode, ToolUsageMetadata,
 };
+use crate::persistence::{ModelEvent, next_conversation_write_revision};
 use crate::terminal::general_settings::GeneralSettings;
 use crate::terminal::model::block::{
     AgentInteractionMetadata, AgentViewVisibility, BlockId, SerializedAIMetadata, SerializedBlock,
@@ -855,7 +857,7 @@ impl AIConversation {
         };
         let total_provider_cost_in_cents = conversation_usage_metadata.total_provider_cost_in_cents;
 
-        Ok(Self {
+        let mut conversation = Self {
             id,
             is_viewing_shared_session: false,
             is_cli_agent_transcript: false,
@@ -897,7 +899,49 @@ impl AIConversation {
             cli_subagent_block_snapshots,
             orchestration_configs: HashMap::new(),
             pinned,
-        })
+        };
+        conversation.restore_pending_compaction_input();
+        Ok(conversation)
+    }
+
+    /// 恢复仅补回可见的停止状态，不写入 provider 历史，也不触发工具或网络请求。
+    fn restore_pending_compaction_input(&mut self) {
+        let recoveries = self
+            .compaction_state
+            .retained_recoveries()
+            .iter()
+            .chain(self.compaction_state.pending_recovery())
+            .cloned()
+            .collect::<Vec<_>>();
+        // 相同历史锚点的新旧输入从后往前插入，最终保持提交顺序。
+        for pending in recoveries.into_iter().rev() {
+            if pending.is_in_persisted_messages(&self.all_linearized_messages()) {
+                self.compaction_state.clear_pending_recovery(pending.id);
+                self.compaction_state.clear_retained_recovery(pending.id);
+                continue;
+            }
+            if self.exchange_with_id(pending.id).is_some() {
+                continue;
+            }
+            let summary_message_ids = self
+                .all_linearized_messages()
+                .into_iter()
+                .filter(|message| {
+                    pending.summary_request_id.as_deref() == Some(message.request_id.as_str())
+                })
+                .map(|message| MessageId::new(message.id.clone()))
+                .collect();
+            let is_latest = self.task_store.modify_root_task(|task| {
+                task.insert_recovered_exchange(
+                    pending.to_cancelled_exchange(),
+                    pending.anchor_message_id.as_deref(),
+                    &summary_message_ids,
+                )
+            });
+            if is_latest == Some(true) {
+                self.status = ConversationStatus::Cancelled;
+            }
+        }
     }
 
     pub fn id(&self) -> AIConversationId {
@@ -3781,6 +3825,7 @@ impl AIConversation {
         };
 
         ModelEvent::UpdateMultiAgentConversation {
+            revision: next_conversation_write_revision(),
             conversation_id: self.id.to_string(),
             updated_tasks: self
                 .all_tasks()
@@ -3812,7 +3857,10 @@ impl AIConversation {
                 run_id: self.task_id.map(|id| id.to_string()),
                 autoexecute_override: Some(self.autoexecute_override.into()),
                 last_event_sequence: self.last_event_sequence,
-                compaction_state_json: if self.compaction_state.completed().is_empty() {
+                compaction_state_json: if self.compaction_state.completed().is_empty()
+                    && self.compaction_state.pending_recovery().is_none()
+                    && self.compaction_state.retained_recoveries().is_empty()
+                {
                     None
                 } else {
                     match serde_json::to_string(&self.compaction_state) {
@@ -3890,6 +3938,55 @@ impl AIConversation {
         sqlite_sender
             .try_send(self.updated_conversation_state_event())
             .map_err(|e| UpdateConversationError::ByopPreflightPersistenceSend(format!("{e:?}")))
+    }
+
+    /// 启用历史保存时，摘要和续发必须等待事务完成；关闭保存时沿用内存流程。
+    pub(crate) fn checkpoint_compaction_recovery_state(
+        &self,
+        ctx: &mut ModelContext<BlocklistAIHistoryModel>,
+    ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, UpdateConversationError> {
+        if self.is_viewing_shared_session
+            || !*GeneralSettings::as_ref(ctx).persist_conversations
+            || !AppExecutionMode::as_ref(ctx).can_save_session()
+        {
+            return Ok(None);
+        }
+        self.ensure_can_persist_byop_preflight_state(ctx)?;
+        let sqlite_sender = GlobalResourceHandlesProvider::as_ref(ctx)
+            .get()
+            .model_event_sender
+            .as_ref()
+            .ok_or_else(|| {
+                UpdateConversationError::ByopPreflightPersistenceUnavailable(
+                    "sqlite sender is unavailable".to_owned(),
+                )
+            })?;
+        let ModelEvent::UpdateMultiAgentConversation {
+            revision,
+            conversation_id,
+            updated_tasks,
+            conversation_data,
+        } = self.updated_conversation_state_event()
+        else {
+            unreachable!("会话快照必须生成完整会话更新事件");
+        };
+        let (completion, receiver) = oneshot::channel();
+        sqlite_sender
+            .try_send(ModelEvent::CheckpointMultiAgentConversation {
+                revision,
+                conversation_id,
+                updated_tasks,
+                conversation_data,
+                completion,
+            })
+            .map_err(|error| {
+                let reason = match error {
+                    TrySendError::Full(_) => "SQLite writer queue is full",
+                    TrySendError::Disconnected(_) => "SQLite writer is closed",
+                };
+                UpdateConversationError::ByopPreflightPersistenceSend(reason.to_owned())
+            })?;
+        Ok(Some(receiver))
     }
 
     pub(crate) fn write_updated_conversation_state(
@@ -5300,3 +5397,7 @@ impl ConversationStatus {
 #[cfg(test)]
 #[path = "conversation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "conversation_recovery_tests.rs"]
+mod recovery_tests;

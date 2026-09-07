@@ -7,6 +7,7 @@ use crate::ai::blocklist::context_model::{PendingAttachment, PendingFile};
 use crate::ai::blocklist::controller::response_stream::StreamCancellation;
 use crate::ai::blocklist::{QueuedQuery, QueuedQueryOrigin};
 use crate::settings::{AISettings, AgentProvider, AgentProviderApiType, AgentProviderModel};
+use crate::terminal::general_settings::GeneralSettings;
 use crate::test_util::ai_agent_tasks::{create_api_task, create_message};
 use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
 
@@ -122,6 +123,7 @@ fn interrupted_compaction_keeps_input(cancellation: Option<CancellationReason>) 
                     stream_id.clone(),
                     PendingByopCompactionRequest {
                         request: PendingByopRequest {
+                            recovery_id: None,
                             context_snapshot: None,
                             allow_auto_compaction: false,
                             request_input: request_input(
@@ -503,6 +505,7 @@ fn retained_compaction_input_does_not_finish_new_request() {
                 controller.register_mock_stream_for_test(id, conversation_id, stream, ctx);
                 assert!(controller.has_active_stream_for_conversation(conversation_id, ctx));
                 controller.retain_input_after_failed_compaction(PendingByopRequest {
+                            recovery_id: None,
                     context_snapshot: None,
                     allow_auto_compaction: false,
                     request_input: request_input(conversation_id, root, query_input("先前未发的问题")),
@@ -599,6 +602,7 @@ fn cancelled_compaction_preserves_new_turn_and_fires_queue_only_after_it_finishe
                         old_id.clone(),
                         PendingByopCompactionRequest {
                             request: PendingByopRequest {
+                                recovery_id: None,
                                 context_snapshot: None,
                                 allow_auto_compaction: false,
                                 request_input: request_input(
@@ -792,6 +796,7 @@ fn retained_compaction_input_preserves_the_actual_summary_error() {
             });
             terminal.ai_controller().update(ctx, |controller, ctx| {
                 controller.retain_input_after_failed_compaction(PendingByopRequest {
+                            recovery_id: None,
                     context_snapshot: None,
                     allow_auto_compaction: false,
                     request_input: request_input(conversation_id, root, query_input("待发原问题")),
@@ -816,6 +821,13 @@ fn retained_compaction_input_preserves_the_actual_summary_error() {
 fn readiness_compaction_preserves_context_added_while_waiting_with_unchanged_text() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
+        // 此用例只验证草稿归属；实际 SQLite 确认由强杀与故障用例单独覆盖。
+        GeneralSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .persist_conversations
+                .set_value(false, ctx)
+                .unwrap();
+        });
         let terminal = add_window_with_terminal(&mut app, None);
         let mut provider = AgentProvider::new_empty();
         provider.id = "readiness-context-provider".to_owned();
@@ -905,6 +917,7 @@ fn readiness_compaction_preserves_context_added_while_waiting_with_unchanged_tex
                         controller.pending_byop_requests.insert(
                             conversation_id,
                             PendingByopRequest {
+                                recovery_id: None,
                                 context_snapshot: Some(snapshot),
                                 allow_auto_compaction: true,
                                 request_input: pending_input,

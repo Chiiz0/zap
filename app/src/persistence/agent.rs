@@ -17,7 +17,7 @@ use crate::persistence::schema::{self, agent_conversations, agent_tasks};
 /// Maximum size of a single serialized `api::Task` protobuf BLOB stored in
 /// `agent_tasks.task`. Tasks exceeding this limit are skipped on both write
 /// and read to prevent startup OOM when all task records are loaded at once.
-const MAX_TASK_BLOB_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+pub(super) const MAX_TASK_BLOB_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Debug, Insertable, AsChangeset)]
 #[diesel(table_name = agent_conversations)]

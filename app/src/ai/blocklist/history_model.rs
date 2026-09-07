@@ -44,8 +44,8 @@ use crate::ai::byop_readiness::{
 };
 use crate::ai::document::ai_document_model::AIDocumentModel;
 use crate::input_suggestions::HistoryOrder;
-use crate::persistence::ModelEvent;
 use crate::persistence::model::{AgentConversation, AgentConversationData};
+use crate::persistence::{ModelEvent, next_conversation_write_revision};
 #[cfg(feature = "local_fs")]
 use crate::persistence::{database_file_path_for_current_scope, establish_ro_connection};
 use crate::terminal::model::block::BlockId;
@@ -1609,6 +1609,7 @@ impl BlocklistAIHistoryModel {
         let forked_conversation_id = AIConversationId::new();
         if let Err(e) = sqlite_sender.send(ModelEvent::UpdateMultiAgentConversation {
             conversation_id: forked_conversation_id.to_string(),
+            revision: next_conversation_write_revision(),
             updated_tasks: updated_tasks_with_new_ids.clone(),
             conversation_data: conversation_data.clone(),
         }) {
@@ -1805,6 +1806,7 @@ impl BlocklistAIHistoryModel {
         let forked_conversation_id = AIConversationId::new();
         if let Err(e) = sqlite_sender.send(ModelEvent::UpdateMultiAgentConversation {
             conversation_id: forked_conversation_id.to_string(),
+            revision: next_conversation_write_revision(),
             updated_tasks: updated_tasks_with_new_ids.clone(),
             conversation_data: conversation_data.clone(),
         }) {

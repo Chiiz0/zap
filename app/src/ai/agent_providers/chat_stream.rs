@@ -4165,7 +4165,10 @@ pub async fn generate_byop_output(
         ));
     }
     let client = build_client(api_type, &base_url, api_key);
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = params
+        .byop_recovery_request_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let mcp_context = params.mcp_context.clone();
     let tool_names_for_extract = available_tool_names(&params);
     let response_cancel_control = native_responses_request
@@ -8709,3 +8712,7 @@ mod budget_tests;
 #[cfg(test)]
 #[path = "chat_stream_compaction_tests.rs"]
 mod compaction_tests;
+
+#[cfg(test)]
+#[path = "chat_stream_live_tests.rs"]
+mod live_tests;

@@ -11,6 +11,12 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ai::agent::AIAgentExchangeId;
+
+#[path = "recovery.rs"]
+mod recovery;
+pub use recovery::{CompactionPersistenceError, PendingCompactionRecovery};
+
 /// 触发压缩的来源。`Auto` 仅由 token-overflow 自动触发,`Manual` 是 /compact /compact-and。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CompactionTrigger {
@@ -72,6 +78,11 @@ pub struct CompactionState {
     markers: HashMap<String, MessageMarker>,
     #[serde(default)]
     completed: Vec<CompletedCompaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_recovery: Option<PendingCompactionRecovery>,
+    /// 已被后续请求接管的待发输入，仅保留停止行，不作为“继续”的恢复目标。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained_recoveries: Vec<PendingCompactionRecovery>,
 }
 
 impl Default for CompactionState {
@@ -80,12 +91,14 @@ impl Default for CompactionState {
             version: Self::VERSION,
             markers: HashMap::new(),
             completed: Vec::new(),
+            pending_recovery: None,
+            retained_recoveries: Vec::new(),
         }
     }
 }
 
 impl CompactionState {
-    pub const VERSION: u32 = 3;
+    pub const VERSION: u32 = 4;
     fn current_version() -> u32 {
         Self::VERSION
     }
@@ -136,6 +149,77 @@ impl CompactionState {
 
     pub fn completed(&self) -> &[CompletedCompaction] {
         &self.completed
+    }
+
+    pub fn pending_recovery(&self) -> Option<&PendingCompactionRecovery> {
+        self.pending_recovery.as_ref()
+    }
+
+    pub fn set_pending_recovery(&mut self, recovery: PendingCompactionRecovery) {
+        let recovery_id = recovery.id;
+        if let Some(previous) = self.pending_recovery.replace(recovery)
+            && previous.id != recovery_id
+        {
+            // 旧输入尚未进入正式消息时，下一次摘要不能覆盖其唯一持久化副本。
+            self.retained_recoveries
+                .retain(|retained| retained.id != previous.id);
+            self.retained_recoveries.push(previous);
+        }
+        self.retained_recoveries
+            .retain(|retained| retained.id != recovery_id);
+    }
+
+    pub fn retained_recoveries(&self) -> &[PendingCompactionRecovery] {
+        &self.retained_recoveries
+    }
+
+    pub fn clear_retained_recovery(&mut self, id: AIAgentExchangeId) {
+        self.retained_recoveries
+            .retain(|retained| retained.id != id);
+    }
+
+    /// 只关联当前恢复记录，迟到的旧流不能改变新问题的继续目标。
+    pub fn set_recovery_owner(
+        &mut self,
+        id: AIAgentExchangeId,
+        exchange_id: AIAgentExchangeId,
+    ) -> bool {
+        if let Some(pending) = self
+            .pending_recovery
+            .as_mut()
+            .filter(|pending| pending.id == id)
+        {
+            pending.owner_exchange_id = Some(exchange_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_pending_recovery(&mut self, id: AIAgentExchangeId) -> bool {
+        if self
+            .pending_recovery
+            .as_ref()
+            .is_some_and(|pending| pending.id == id)
+        {
+            self.pending_recovery = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_recovery_resumed(&mut self, id: AIAgentExchangeId, request_id: String) -> bool {
+        if let Some(pending) = self
+            .pending_recovery
+            .as_mut()
+            .filter(|pending| pending.id == id)
+        {
+            pending.resumed_request_id = Some(request_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// 所有应在拼请求时跳过的 message id(对齐 opencode `hidden`):

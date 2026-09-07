@@ -14,6 +14,14 @@ fn byop_blocked_readiness_error_is_not_retryable() {
 }
 
 #[test]
+fn compaction_persistence_failure_is_not_retried_as_a_network_error() {
+    let error = AIApiError::Other(CompactionPersistenceError("保存失败".to_owned()).into());
+
+    assert!(!error.is_retryable());
+    assert!(!error.is_context_window_exceeded());
+}
+
+#[test]
 fn provider_protocol_error_is_not_retried_blindly() {
     let error = AIApiError::ProviderProtocol("response.incomplete".to_owned());
 

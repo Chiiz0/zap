@@ -191,6 +191,7 @@ fn persisted_agent_conversation_from_update_event(event: ModelEvent) -> AgentCon
         conversation_id,
         updated_tasks,
         conversation_data,
+        ..
     } = event
     else {
         panic!("expected UpdateMultiAgentConversation event");
@@ -2636,6 +2637,7 @@ fn test_optimistic_root_restore_round_trip_yields_in_progress_optimistic_root() 
             conversation_id: child_id_str,
             updated_tasks,
             conversation_data,
+            ..
         } = first_event
         else {
             panic!("expected UpdateMultiAgentConversation event");

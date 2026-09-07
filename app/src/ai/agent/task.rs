@@ -644,6 +644,39 @@ impl Task {
         self.exchanges.push(exchange);
     }
 
+    /// 恢复旧待发问题时放回原有位置，避免越过其后已提交的新问题。
+    pub(super) fn insert_recovered_exchange(
+        &mut self,
+        exchange: AIAgentExchange,
+        anchor_message_id: Option<&str>,
+        summary_message_ids: &HashSet<MessageId>,
+    ) -> bool {
+        let anchor_index = anchor_message_id.and_then(|anchor| {
+            self.exchanges
+                .iter()
+                .rposition(|existing| existing.added_message_ids.iter().any(|id| &**id == anchor))
+        });
+        let mut index = anchor_index.map(|index| index + 1).unwrap_or_else(|| {
+            self.exchanges
+                .iter()
+                .position(|existing| existing.start_time > exchange.start_time)
+                .unwrap_or(self.exchanges.len())
+        });
+        // 摘要本身可以保留在待发问题之前，但不能跳过后来的用户请求。
+        while self.exchanges.get(index).is_some_and(|existing| {
+            !existing.added_message_ids.is_empty()
+                && existing
+                    .added_message_ids
+                    .iter()
+                    .all(|id| summary_message_ids.contains(id))
+        }) {
+            index += 1;
+        }
+        let is_latest = index == self.exchanges.len();
+        self.exchanges.insert(index, exchange);
+        is_latest
+    }
+
     fn try_get_source(&self) -> Result<&api::Task, UpdateTaskError> {
         let TaskImpl::Server(ServerTask { source, .. }) = &self.data else {
             return Err(UpdateTaskError::TaskNotInitialized);

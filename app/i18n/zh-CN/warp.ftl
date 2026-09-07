@@ -5122,6 +5122,7 @@ ai-error-request-failed = 请求失败：{ $error }
 ai-error-quota-limit-reached = 已达到配额上限。
 ai-error-context-window-exceeded = 已超出上下文窗口：{ $message }
 ai-error-context-too-large = 请求上下文过大，已停止自动重试。请压缩会话或减少附加内容后重试。
+ai-error-compaction-save-failed = 未能保存待发送的请求。请检查磁盘空间和写入权限，然后重试。
 ai-error-compaction-invalid = 模型未返回完整的会话摘要，原始历史已保留。请重新压缩会话或切换模型。
 ai-error-invalid-api-key = { $provider } 的 API 密钥无效
 ai-error-bedrock-credentials-invalid = { $model } 的 AWS Bedrock 凭证已过期或无效。

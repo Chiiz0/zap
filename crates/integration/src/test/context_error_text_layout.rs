@@ -37,6 +37,10 @@ fn check_context_error_text_layout(locale: &str, ctx: &AppContext) -> Result<(),
             "ai-error-compaction-invalid",
             loader.get("ai-error-compaction-invalid"),
         ),
+        (
+            "ai-error-compaction-save-failed",
+            loader.get("ai-error-compaction-save-failed"),
+        ),
         ("ai-error-context-window-exceeded", wrapped),
     ] {
         if text.is_empty() || text.contains("ai-error-") || text.contains('{') {

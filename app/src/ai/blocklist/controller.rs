@@ -14,11 +14,13 @@ use std::sync::Arc;
 use ai::skills::SkillPathOrigin;
 use anyhow::anyhow;
 use chrono::{DateTime, Local};
+use futures::channel::oneshot;
 use input_context::{input_context_for_request, parse_context_attachments};
 use itertools::Itertools;
 use parking_lot::FairMutex;
 use pending_response_streams::PendingResponseStreams;
 pub use slash_command::*;
+use uuid::Uuid;
 use warp_core::assertions::safe_assert;
 use warp_multi_agent_api::client_action::{Action, UpdateTaskDescription};
 use warp_multi_agent_api::{ClientAction, Task, ToolType, message};
@@ -47,6 +49,7 @@ use crate::ai::agent::{
 };
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::api_error::AIApiError;
+use crate::ai::byop_compaction::state::PendingCompactionRecovery;
 use crate::ai::byop_readiness::{
     BlockedByopReadinessError, PendingByopToolResultsError, ReadinessCategory,
     ReadinessDiagnosticCoalescer, ReadinessDiagnosticContext, ReadinessDiagnosticLevel,
@@ -412,6 +415,7 @@ pub struct BlocklistAIController {
 /// 见 `pending_byop_requests`。
 struct PendingByopRequest {
     allow_auto_compaction: bool,
+    recovery_id: Option<AIAgentExchangeId>,
     /// readiness 等待前的上下文；等待期间新增的附件不属于这次待发请求。
     context_snapshot: Option<PendingContextSnapshot>,
     request_input: RequestInput,
@@ -1592,6 +1596,7 @@ impl BlocklistAIController {
         };
         let PendingByopRequest {
             allow_auto_compaction,
+            recovery_id,
             context_snapshot,
             mut request_input,
             query_metadata,
@@ -1640,6 +1645,8 @@ impl BlocklistAIController {
             can_attempt_resume_on_error,
             is_queued_prompt,
             allow_auto_compaction,
+            recovery_id,
+            None,
             ctx,
         ) {
             // 二次失败时不再循环排队:若仍报 Pending,Err 已被 send_request_input 内部重新
@@ -1665,6 +1672,53 @@ impl BlocklistAIController {
             log::error!("Tried to resume non-existent conversation: {conversation_id:?}");
             return;
         };
+        if let Some(recovery) = conversation
+            .compaction_state
+            .pending_recovery()
+            .filter(|pending| {
+                !pending.is_in_persisted_messages(&conversation.all_linearized_messages())
+                    && conversation
+                        .latest_visible_exchange()
+                        .is_some_and(|exchange| pending.is_resume_target(exchange.id))
+            })
+            .cloned()
+        {
+            // 重启恢复只由用户手动继续；原附件来自检查点，不消费后来编辑的草稿。
+            if is_auto_resume_after_error {
+                return;
+            }
+            let mut request = recovery.to_request_input(
+                conversation_id,
+                conversation.get_root_task_id(),
+                self.get_current_response_initiator(),
+            );
+            // 空历史重载会重新创建根任务；恢复输入不能继续指向已消失的任务 ID。
+            let mut restored_inputs: HashMap<TaskId, Vec<AIAgentInput>> = HashMap::new();
+            for (task_id, inputs) in request.input_messages {
+                let restored_task_id = if conversation.get_task(&task_id).is_some() {
+                    task_id
+                } else {
+                    conversation.get_root_task_id().clone()
+                };
+                restored_inputs
+                    .entry(restored_task_id)
+                    .or_default()
+                    .extend(inputs);
+            }
+            request.input_messages = restored_inputs;
+            let _ = self.send_request_input_with_compaction(
+                request,
+                None,
+                true,
+                false,
+                true,
+                true,
+                Some(recovery.id),
+                None,
+                ctx,
+            );
+            return;
+        }
         let task_id = {
             let terminal_model = self.terminal_model.lock();
             let active_block = terminal_model.block_list().active_block();
@@ -3085,6 +3139,11 @@ impl BlocklistAIController {
                         }
                     },
                 };
+                if let Some(recovery_id) = pending.recovery_id {
+                    conversation
+                        .compaction_state
+                        .set_recovery_owner(recovery_id, exchange_id);
+                }
                 conversation.write_updated_conversation_state(ctx);
                 ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
                     exchange_id,
@@ -3142,9 +3201,52 @@ impl BlocklistAIController {
                 );
             }
             if let Some(conversation) = history.conversation_mut(&conversation_id) {
+                let exchange_id = conversation
+                    .new_exchange_ids_for_response(&stream_id)
+                    .next();
+                if let Some(recovery_id) = pending.recovery_id
+                    && let Some(exchange_id) = exchange_id
+                {
+                    conversation
+                        .compaction_state
+                        .set_recovery_owner(recovery_id, exchange_id);
+                }
                 conversation.cleanup_completed_response_stream(&stream_id);
             }
         });
+    }
+
+    fn complete_byop_compaction_save_failed(
+        &mut self,
+        request_input: RequestInput,
+        model_id: LLMId,
+        is_queued_prompt: bool,
+        recovery_id: AIAgentExchangeId,
+        ctx: &mut ModelContext<Self>,
+    ) -> anyhow::Result<(AIConversationId, ResponseStreamId)> {
+        let conversation_id = request_input.conversation_id;
+        let result = self.complete_byop_blocked_request(
+            request_input,
+            conversation_id,
+            model_id,
+            is_queued_prompt,
+            crate::t!("ai-error-compaction-save-failed"),
+            ctx,
+        );
+        if result.is_ok() {
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, _| {
+                if let Some(conversation) = history.conversation_mut(&conversation_id)
+                    && let Some(exchange_id) = conversation
+                        .latest_visible_exchange()
+                        .map(|exchange| exchange.id)
+                {
+                    conversation
+                        .compaction_state
+                        .set_recovery_owner(recovery_id, exchange_id);
+                }
+            });
+        }
+        result
     }
 
     fn send_request_input(
@@ -3163,6 +3265,8 @@ impl BlocklistAIController {
             can_attempt_resume_on_error,
             is_queued_prompt,
             true,
+            None,
+            None,
             ctx,
         )
     }
@@ -3175,6 +3279,8 @@ impl BlocklistAIController {
         can_attempt_resume_on_error: bool,
         is_queued_prompt: bool,
         allow_auto_compaction: bool,
+        recovery_id: Option<AIAgentExchangeId>,
+        mut persistence_checkpoint: Option<oneshot::Receiver<Result<(), String>>>,
         ctx: &mut ModelContext<Self>,
     ) -> anyhow::Result<(AIConversationId, ResponseStreamId)> {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
@@ -3263,6 +3369,7 @@ impl BlocklistAIController {
                     conversation_id,
                     PendingByopRequest {
                         allow_auto_compaction,
+                        recovery_id,
                         context_snapshot: Some(
                             self.context_model.as_ref(ctx).pending_context_snapshot(),
                         ),
@@ -3369,6 +3476,50 @@ impl BlocklistAIController {
                 // readiness 已持久化完成的工具结果；保留剩余原输入，摘要本身不重执行工具。
                 let summary_input =
                     self.byop_compaction_request_input(conversation_id, Some(&request_input), ctx)?;
+                let mut recovery = PendingCompactionRecovery::from_request(&request_input);
+                recovery.summary_request_id = Some(Uuid::new_v4().to_string());
+                let recovery_id = recovery.id;
+                let checkpoint = history_model.update(ctx, |history, ctx| {
+                    let conversation = history
+                        .conversation_mut(&conversation_id)
+                        .ok_or_else(|| anyhow!("摘要目标会话不存在"))?;
+                    recovery.anchor_message_id = conversation
+                        .all_tasks()
+                        .find(|task| task.id() == conversation.get_root_task_id())
+                        .and_then(|task| task.source())
+                        .and_then(|task| task.messages.last())
+                        .map(|message| message.id.clone());
+                    // 已进入正式历史的原输入无需再存档；未发送的旧问题由 sidecar 保留。
+                    let completed_recovery_id = conversation
+                        .compaction_state
+                        .pending_recovery()
+                        .filter(|pending| {
+                            pending
+                                .is_in_persisted_messages(&conversation.all_linearized_messages())
+                        })
+                        .map(|pending| pending.id);
+                    if let Some(completed_recovery_id) = completed_recovery_id {
+                        conversation
+                            .compaction_state
+                            .clear_pending_recovery(completed_recovery_id);
+                    }
+                    conversation.compaction_state.set_pending_recovery(recovery);
+                    conversation
+                        .checkpoint_compaction_recovery_state(ctx)
+                        .map_err(anyhow::Error::from)
+                });
+                let checkpoint = match checkpoint {
+                    Ok(checkpoint) => checkpoint,
+                    Err(_) => {
+                        return self.complete_byop_compaction_save_failed(
+                            request_input,
+                            request_params.model.clone(),
+                            is_queued_prompt,
+                            recovery_id,
+                            ctx,
+                        );
+                    }
+                };
                 let result = self.send_request_input_with_compaction(
                     summary_input,
                     None,
@@ -3376,6 +3527,8 @@ impl BlocklistAIController {
                     false,
                     false,
                     false,
+                    Some(recovery_id),
+                    checkpoint,
                     ctx,
                 );
                 if let Ok((_, stream_id)) = &result {
@@ -3413,6 +3566,7 @@ impl BlocklistAIController {
                                 clear_input_on_success,
                                 request: PendingByopRequest {
                                     allow_auto_compaction,
+                                    recovery_id: Some(recovery_id),
                                     context_snapshot: None,
                                     request_input,
                                     query_metadata,
@@ -3440,6 +3594,45 @@ impl BlocklistAIController {
         let server_conversation_token_for_identifiers =
             conversation_data.server_conversation_token.clone();
 
+        if let Some(recovery_id) = recovery_id {
+            let checkpoint = history_model.update(ctx, |history, ctx| {
+                let conversation = history
+                    .conversation_mut(&conversation_id)
+                    .ok_or_else(|| anyhow!("恢复目标会话不存在"))?;
+                let recovery = conversation
+                    .compaction_state
+                    .pending_recovery()
+                    .filter(|pending| pending.id == recovery_id)
+                    .ok_or_else(|| anyhow!("待发请求已由新请求接管"))?;
+                if is_summarization {
+                    request_params.byop_recovery_request_id = recovery.summary_request_id.clone();
+                    Ok(None)
+                } else {
+                    let request_id = Uuid::new_v4().to_string();
+                    conversation
+                        .compaction_state
+                        .mark_recovery_resumed(recovery_id, request_id.clone());
+                    request_params.byop_recovery_request_id = Some(request_id);
+                    conversation
+                        .checkpoint_compaction_recovery_state(ctx)
+                        .map_err(anyhow::Error::from)
+                }
+            });
+            match checkpoint {
+                Ok(Some(checkpoint)) => persistence_checkpoint = Some(checkpoint),
+                Ok(None) => {}
+                Err(_) => {
+                    return self.complete_byop_compaction_save_failed(
+                        request_input,
+                        request_params.model.clone(),
+                        is_queued_prompt,
+                        recovery_id,
+                        ctx,
+                    );
+                }
+            }
+        }
+
         let response_stream = ctx.add_model(|ctx| {
             // Create AIIdentifiers for the response stream
             let ai_identifiers = AIIdentifiers {
@@ -3454,6 +3647,7 @@ impl BlocklistAIController {
                 ai_identifiers,
                 can_attempt_resume_on_error && !is_summarization,
                 allow_auto_compaction,
+                persistence_checkpoint,
                 ctx,
             )
         });
@@ -3506,6 +3700,18 @@ impl BlocklistAIController {
                 }
                 Err(e) => {
                     log::warn!("Failed to push new exchange to AI conversation: {e:?}");
+                }
+            }
+            if let Some(recovery_id) = recovery_id
+                && let Some(conversation) = history_model.conversation_mut(&conversation_id)
+            {
+                let exchange_id = conversation
+                    .new_exchange_ids_for_response(&response_stream_id)
+                    .next();
+                if let Some(exchange_id) = exchange_id {
+                    conversation
+                        .compaction_state
+                        .set_recovery_owner(recovery_id, exchange_id);
                 }
             }
         });
@@ -4265,6 +4471,8 @@ impl BlocklistAIController {
                             false,
                             true,
                             false,
+                            pending.recovery_id,
+                            None,
                             ctx,
                         );
                         if result.is_err() {
@@ -4323,6 +4531,8 @@ impl BlocklistAIController {
                             false,
                             false,
                             false,
+                            None,
+                            None,
                             ctx,
                         );
                     }
@@ -4785,3 +4995,7 @@ mod queued_query_tests;
 #[cfg(test)]
 #[path = "controller_compaction_tests.rs"]
 mod compaction_tests;
+
+#[cfg(all(test, feature = "local_fs"))]
+#[path = "controller_compaction_crash_tests.rs"]
+mod compaction_crash_tests;

@@ -19,12 +19,14 @@ pub mod testing;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use ai::project_context::model::ProjectRulePath;
 use chrono::{DateTime, Local, Utc};
+use futures::channel::oneshot;
 use instant::Instant;
 #[cfg(any(feature = "local_fs", feature = "integration_tests"))]
 pub use sqlite::database_file_path_for_current_scope;
@@ -35,6 +37,8 @@ pub use sqlite::database_file_path_for_current_scope;
 pub use sqlite::database_file_path_for_scope;
 #[cfg(any(feature = "local_fs", feature = "integration_tests"))]
 pub use sqlite::establish_ro_connection;
+#[cfg(all(test, feature = "local_fs"))]
+pub(crate) use sqlite::{read_test_agent_conversation, start_test_writer};
 use uuid::Uuid;
 use warp_core::command::ExitCode;
 use warp_errors::report_error;
@@ -346,6 +350,12 @@ pub struct FinishedCommandMetadata {
     pub session_id: SessionId,
 }
 
+/// 在快照产生时分配进程内序号，避免后台任务调度改变同一会话的保存顺序。
+pub(crate) fn next_conversation_write_revision() -> u64 {
+    static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug)]
 pub enum ModelEvent {
     SaveBlock(BlockCompleted),
@@ -423,8 +433,17 @@ pub enum ModelEvent {
     },
     UpdateMultiAgentConversation {
         conversation_id: String,
+        revision: u64,
         updated_tasks: Vec<api::Task>,
         conversation_data: AgentConversationData,
+    },
+    /// 只有完整会话快照的 SQLite 事务提交成功才确认，调用方必须把通道关闭视为失败。
+    CheckpointMultiAgentConversation {
+        conversation_id: String,
+        revision: u64,
+        updated_tasks: Vec<api::Task>,
+        conversation_data: AgentConversationData,
+        completion: oneshot::Sender<Result<(), String>>,
     },
     /// Persists read-time-derived conversation summaries for rows written
     /// before the `summary` column existed.

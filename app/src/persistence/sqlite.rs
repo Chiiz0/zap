@@ -25,28 +25,31 @@ use num_traits::FromPrimitive;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use persistence::model::AMBIENT_AGENT_PANE_KIND;
+use prost::Message;
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
 use warp_errors::{report_error, report_if_error};
+use warp_multi_agent_api as api;
 use warpui::platform::FullscreenState;
 use warpui::windowing::{MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
 use warpui::{AppContext, SingletonEntity};
 
 use super::agent::{
-    backfill_conversation_summaries, delete_agent_conversations, read_agent_conversation_metadata,
-    upsert_agent_conversation,
+    MAX_TASK_BLOB_BYTES, backfill_conversation_summaries, delete_agent_conversations,
+    read_agent_conversation_metadata, upsert_agent_conversation,
 };
 use super::block_list::{
     delete_ai_conversation, delete_blocks, save_block, update_block_agent_view_visibility,
     upsert_ai_query,
 };
 use super::model::{
-    self, AI_DOCUMENT_PANE_KIND, AI_FACT_PANE_KIND, ActiveMCPServer, CODE_PANE_KIND,
-    CurrentUserInformation, ENV_VAR_COLLECTION_PANE_KIND, EXECUTION_PROFILE_EDITOR_PANE_KIND,
-    MCP_SERVER_PANE_KIND, MCPEnvironmentVariables, NOTEBOOK_PANE_KIND, NewActiveMCPServer, NewApp,
-    NewCommand, NewFolder, NewNotebook, NewServerExperiment, NewTab, NewTabGroup, NewTeam,
-    NewWindow, NewWorkspace, NewWorkspaceTeam, ObjectMetadata, ObjectPermissions, Project,
-    SETTINGS_PANE_KIND, TERMINAL_PANE_KIND, Tab, TabGroup, WORKFLOW_PANE_KIND, Window,
+    self, AI_DOCUMENT_PANE_KIND, AI_FACT_PANE_KIND, ActiveMCPServer, AgentConversationData,
+    CODE_PANE_KIND, CurrentUserInformation, ENV_VAR_COLLECTION_PANE_KIND,
+    EXECUTION_PROFILE_EDITOR_PANE_KIND, MCP_SERVER_PANE_KIND, MCPEnvironmentVariables,
+    NOTEBOOK_PANE_KIND, NewActiveMCPServer, NewApp, NewCommand, NewFolder, NewNotebook,
+    NewServerExperiment, NewTab, NewTabGroup, NewTeam, NewWindow, NewWorkspace, NewWorkspaceTeam,
+    ObjectMetadata, ObjectPermissions, Project, SETTINGS_PANE_KIND, TERMINAL_PANE_KIND, Tab,
+    TabGroup, WORKFLOW_PANE_KIND, Window,
 };
 use super::{
     BlockCompleted, FinishedCommandMetadata, ModelEvent, PersistedData, PersistedDataScope,
@@ -812,6 +815,7 @@ fn start_writer(conn: SqliteConnection, database_path: PathBuf) -> Result<Writer
         .name("SQLite Writer".into())
         .spawn(move || {
             let mut paused = false;
+            let mut conversation_revisions = HashMap::new();
             loop {
                 let events = match rx.recv() {
                     Ok(event) => {
@@ -870,10 +874,21 @@ fn start_writer(conn: SqliteConnection, database_path: PathBuf) -> Result<Writer
                         }
                         event => {
                             if paused {
+                                if let ModelEvent::CheckpointMultiAgentConversation {
+                                    completion,
+                                    ..
+                                } = event
+                                {
+                                    let _ = completion.send(Err("SQLite 写入器已暂停".to_owned()));
+                                }
                                 log::info!("Ignoring event as SQLite Writer is on pause");
                                 continue;
                             }
-                            if let Err(err) = handle_model_event(event, &mut current_conn) {
+                            if let Err(err) = handle_model_event_with_conversation_revisions(
+                                event,
+                                &mut current_conn,
+                                &mut conversation_revisions,
+                            ) {
                                 report_db_error("Model", err, &database_path);
                             }
                         }
@@ -884,11 +899,67 @@ fn start_writer(conn: SqliteConnection, database_path: PathBuf) -> Result<Writer
     Ok(WriterHandles { handle, sender: tx })
 }
 
+/// 仅初始化调用方提供的临时测试库，不解析当前应用的数据目录。
+#[cfg(test)]
+pub(crate) fn start_test_writer(database_path: &Path) -> Result<WriterHandles> {
+    let connection = setup_database(database_path)?;
+    start_writer(connection, database_path.to_owned())
+}
+
+/// 通过正式会话读取逻辑重载指定的临时测试库，不运行迁移或修改数据库。
+#[cfg(test)]
+pub(crate) fn read_test_agent_conversation(
+    database_path: &Path,
+    conversation_id: &str,
+) -> Result<Option<model::AgentConversation>> {
+    let database_url = database_path.to_str().context("测试数据库路径不是 UTF-8")?;
+    let mut connection = establish_ro_connection(database_url)?;
+    super::agent::read_agent_conversation_by_id(&mut connection, conversation_id)
+        .map_err(anyhow::Error::from)
+}
+
 /// Handles a single [`ModelEvent`] by dispatching to an event-specific function.
 /// Events which affect the SQLite writer event loop _must_ instead be handled by the event loop itself:
 /// * [`ModelEvent::PauseAndRemoveDatabase`]
 /// * [`ModelEvent::ReconstructAndResume`]
 /// * [`ModelEvent::Terminate`]
+fn handle_model_event_with_conversation_revisions(
+    event: ModelEvent,
+    connection: &mut SqliteConnection,
+    conversation_revisions: &mut HashMap<String, u64>,
+) -> Result<()> {
+    let conversation_revision = match &event {
+        ModelEvent::UpdateMultiAgentConversation {
+            conversation_id,
+            revision,
+            ..
+        }
+        | ModelEvent::CheckpointMultiAgentConversation {
+            conversation_id,
+            revision,
+            ..
+        } => Some((conversation_id.clone(), *revision)),
+        _ => None,
+    };
+    if let Some((conversation_id, revision)) = &conversation_revision
+        && conversation_revisions
+            .get(conversation_id)
+            .is_some_and(|last_revision| revision <= last_revision)
+    {
+        // 旧普通快照不能覆盖已确认的恢复记录；旧 checkpoint 也不能冒充当前状态已落盘。
+        if let ModelEvent::CheckpointMultiAgentConversation { completion, .. } = event {
+            let _ = completion.send(Err("会话快照已被更新的状态取代".to_owned()));
+        }
+        return Ok(());
+    }
+
+    handle_model_event(event, connection)?;
+    if let Some((conversation_id, revision)) = conversation_revision {
+        conversation_revisions.insert(conversation_id, revision);
+    }
+    Ok(())
+}
+
 fn handle_model_event(event: ModelEvent, connection: &mut SqliteConnection) -> anyhow::Result<()> {
     match event {
         ModelEvent::PauseAndRemoveDatabase
@@ -998,6 +1069,7 @@ fn handle_model_event(event: ModelEvent, connection: &mut SqliteConnection) -> a
             conversation_id,
             updated_tasks,
             conversation_data,
+            ..
         } => upsert_agent_conversation(
             connection,
             &conversation_id,
@@ -1005,6 +1077,23 @@ fn handle_model_event(event: ModelEvent, connection: &mut SqliteConnection) -> a
             conversation_data,
         )
         .map_err(anyhow::Error::from),
+        ModelEvent::CheckpointMultiAgentConversation {
+            conversation_id,
+            updated_tasks,
+            conversation_data,
+            completion,
+            ..
+        } => {
+            let result = checkpoint_agent_conversation(
+                connection,
+                &conversation_id,
+                &updated_tasks,
+                conversation_data,
+            );
+            // 确认必须发生在外层事务提交之后，不能把排队成功或部分写入当成可恢复快照。
+            let _ = completion.send(result.as_ref().map(|()| ()).map_err(ToString::to_string));
+            result
+        }
         ModelEvent::BackfillConversationSummaries { backfills } => {
             backfill_conversation_summaries(connection, backfills)
                 .map_err(anyhow::Error::from)
@@ -1072,6 +1161,36 @@ fn handle_model_event(event: ModelEvent, connection: &mut SqliteConnection) -> a
         } => save_ai_document_content(connection, &document_id, &content, version, &title)
             .context("error saving AI document content"),
     }
+}
+
+fn checkpoint_agent_conversation(
+    connection: &mut SqliteConnection,
+    conversation_id: &str,
+    tasks: &[api::Task],
+    conversation_data: AgentConversationData,
+) -> Result<()> {
+    if tasks
+        .iter()
+        .any(|task| task.encoded_len() > MAX_TASK_BLOB_BYTES)
+    {
+        bail!("会话快照包含超过持久化上限的任务");
+    }
+    connection.transaction(|connection| {
+        upsert_agent_conversation(connection, conversation_id, tasks, conversation_data)?;
+        // 普通写入会淘汰旧会话；可靠快照必须确认目标会话和所有任务仍留在库中。
+        let conversation_count: i64 = schema::agent_conversations::table
+            .filter(schema::agent_conversations::conversation_id.eq(conversation_id))
+            .count()
+            .get_result(connection)?;
+        let task_count: i64 = schema::agent_tasks::table
+            .filter(schema::agent_tasks::conversation_id.eq(conversation_id))
+            .count()
+            .get_result(connection)?;
+        if conversation_count != 1 || usize::try_from(task_count).ok() != Some(tasks.len()) {
+            bail!("会话快照未完整保留在数据库中");
+        }
+        Ok(())
+    })
 }
 
 /// Report a database error and additional context for debugging.
@@ -4019,3 +4138,7 @@ fn delete_objects(
 #[cfg(test)]
 #[path = "sqlite_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sqlite_checkpoint_tests.rs"]
+mod checkpoint_tests;

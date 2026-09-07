@@ -67,7 +67,7 @@ jobs:
         shell: bash
         run: >-
           cargo nextest run --no-fail-fast -p warp --lib
-          -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::tests) | test(i18n::tests)'
+          -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::) | test(ai::blocklist::history_model) | test(persistence::sqlite::checkpoint_tests) | test(i18n::tests)'
 
       - name: Test rust-genai
         shell: bash
@@ -155,7 +155,7 @@ jobs:
         shell: pwsh
         run: >-
           cargo nextest run --no-fail-fast -p warp --lib
-          -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::tests) | test(i18n::tests)'
+          -E 'test(responses) | test(ai::agent_providers::) | test(ai::api_error::tests) | test(ai::byop_compaction::) | test(ai::blocklist::controller) | test(ai::agent::conversation::) | test(ai::blocklist::history_model) | test(persistence::sqlite::checkpoint_tests) | test(i18n::tests)'
 
       - name: Test rust-genai
         shell: pwsh

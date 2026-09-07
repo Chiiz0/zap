@@ -15,6 +15,7 @@ use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{AIAgentInput, AIIdentifiers, CancellationReason};
 use crate::ai::api_error::AIApiError;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
+use crate::ai::byop_compaction::state::CompactionPersistenceError;
 use crate::ai::byop_readiness::BlockedByopReadinessError;
 use crate::network::NetworkStatus;
 use crate::{report_error, send_telemetry_from_ctx};
@@ -286,9 +287,10 @@ impl ResponseStream {
         ai_identifiers: AIIdentifiers,
         can_attempt_resume_on_error: bool,
         allow_auto_compaction: bool,
+        persistence_checkpoint: Option<oneshot::Receiver<Result<(), String>>>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        let (cancellation_tx, cancellation_rx) = oneshot::channel();
+        let (cancellation_tx, mut cancellation_rx) = oneshot::channel();
         let start_time = Local::now();
 
         let request_id = Uuid::new_v4();
@@ -314,8 +316,23 @@ impl ResponseStream {
         let pending_title_generation = byop_dispatch
             .as_ref()
             .and_then(|byop| pending_title_generation_from_byop(&params, byop));
+        let persistence_error = crate::t!("ai-error-compaction-save-failed");
         let _ = ctx.spawn(
             async move {
+                if let Some(checkpoint) = persistence_checkpoint {
+                    // 确认和取消同时就绪时优先取消，不能再启动计数或生成请求。
+                    match futures::future::select(&mut cancellation_rx, checkpoint).await {
+                        futures::future::Either::Right((Ok(Ok(())), _)) => {}
+                        futures::future::Either::Right((Ok(Err(_)) | Err(_), _)) => {
+                            return Err(ConvertToAPITypeError::Other(
+                                CompactionPersistenceError(persistence_error).into(),
+                            ));
+                        }
+                        futures::future::Either::Left(_) => {
+                            return Ok(Box::pin(futures::stream::empty()) as api::ResponseStream);
+                        }
+                    }
+                }
                 if let Some(byop) = byop_dispatch {
                     crate::ai::agent_providers::chat_stream::generate_byop_output(
                         crate::ai::agent_providers::chat_stream::ByopOutputInput {
@@ -511,6 +528,10 @@ impl ResponseStream {
         stream_result: Result<api::ResponseStream, ConvertToAPITypeError>,
         ctx: &mut ModelContext<Self>,
     ) {
+        // 等待落盘期间可能已经取消或被新请求接管，迟到的确认不能改写新请求状态。
+        if self.current_request_id != Some(request_id) {
+            return;
+        }
         match stream_result {
             Ok(stream) => {
                 ctx.spawn_stream_local(
@@ -657,6 +678,11 @@ impl ResponseStream {
 }
 
 fn convert_to_api_error(error: ConvertToAPITypeError) -> AIApiError {
+    if let ConvertToAPITypeError::Other(inner) = &error {
+        if let Some(persistence) = inner.downcast_ref::<CompactionPersistenceError>() {
+            return AIApiError::Other(CompactionPersistenceError(persistence.0.clone()).into());
+        }
+    }
     match &error {
         ConvertToAPITypeError::Other(inner)
             if inner.downcast_ref::<BlockedByopReadinessError>().is_some() =>
