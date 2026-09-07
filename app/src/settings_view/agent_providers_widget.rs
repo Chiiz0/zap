@@ -59,7 +59,6 @@ const MODEL_ROW_GAP: f32 = 6.0;
 
 std::thread_local! {
     /// {provider_id => Set<model_index>} 当前展开的模型条目。
-    /// 关 settings 页就丢,行为类似 `models_dev::chips_expanded()` 的 AtomicBool。
     static EXPANDED_MODELS: RefCell<HashMap<String, HashSet<usize>>> = RefCell::new(HashMap::new());
 }
 
@@ -275,12 +274,6 @@ impl ProviderDraftEditors {
 /// 自定义 Agent Provider 设置 widget。
 pub(super) struct AgentProvidersWidget {
     add_button_state: MouseStateHandle,
-    refresh_catalog_button_state: MouseStateHandle,
-    expand_chips_button_state: MouseStateHandle,
-    /// 快速添加 chip 行的搜索框。
-    search_editor: ViewHandle<EditorView>,
-    /// 每个 catalog provider id 一个按钮 state — chip 行使用。
-    quick_add_button_states: RefCell<HashMap<String, MouseStateHandle>>,
     rows: RefCell<HashMap<String, ProviderRow>>,
 }
 
@@ -296,36 +289,8 @@ impl AgentProvidersWidget {
         // 进入页面即触发一次目录加载(磁盘缓存 + 必要时网络)。
         ctx.dispatch_typed_action_deferred(AISettingsPageAction::EnsureModelsDevLoaded);
 
-        // ---- 搜索框 ----
-        let initial_query = crate::ai::agent_providers::models_dev::search_query();
-        let search_editor = ctx.add_typed_action_view(move |ctx| {
-            let appearance = Appearance::handle(ctx).as_ref(ctx);
-            let options = single_line_editor_options(appearance, false);
-            let mut editor = EditorView::single_line(options, ctx);
-            editor.set_placeholder_text(
-                crate::t!("settings-agent-providers-search-placeholder"),
-                ctx,
-            );
-            if !initial_query.is_empty() {
-                editor.set_buffer_text(&initial_query, ctx);
-            }
-            editor
-        });
-        ctx.subscribe_to_view(&search_editor, move |_, editor, event, ctx| {
-            if matches!(event, EditorEvent::Edited(_)) {
-                let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
-                ctx.dispatch_typed_action_deferred(AISettingsPageAction::SetModelsDevSearchQuery(
-                    buffer_text,
-                ));
-            }
-        });
-
         Self {
             add_button_state: MouseStateHandle::default(),
-            refresh_catalog_button_state: MouseStateHandle::default(),
-            expand_chips_button_state: MouseStateHandle::default(),
-            search_editor,
-            quick_add_button_states: RefCell::new(HashMap::new()),
             rows: RefCell::new(rows),
         }
     }
@@ -1669,188 +1634,6 @@ fn field_block(
         .finish()
 }
 
-impl AgentProvidersWidget {
-    /// 渲染 "来自 models.dev 的已知 provider 快速添加" 区:
-    /// - 标题 + "刷新目录" 按钮
-    /// - 一行 chip(每个对应一个 catalog provider id),点击即新建本地 provider 并预填模型
-    /// - 目录尚未加载时,显示 "正在拉取..."
-    fn render_models_dev_section(
-        &self,
-        appearance: &Appearance,
-        _app: &AppContext,
-    ) -> Box<dyn Element> {
-        use crate::ai::agent_providers::models_dev;
-
-        let label_color = appearance.theme().active_ui_text_color();
-        let dim_color = appearance.theme().disabled_ui_text_color();
-
-        let title = Text::new(
-            crate::t!("settings-agent-providers-quick-add-title"),
-            appearance.ui_font_family(),
-            appearance.ui_font_size(),
-        )
-        .with_color(label_color.into())
-        .finish();
-
-        let refresh_button = Self::render_card_button(
-            crate::t!("settings-agent-providers-refresh-catalog"),
-            self.refresh_catalog_button_state.clone(),
-            AISettingsPageAction::RefreshModelsDev,
-            appearance,
-        );
-
-        let search_box = Container::new(ChildView::new(&self.search_editor).finish())
-            .with_margin_left(8.)
-            .with_margin_right(8.)
-            .finish();
-
-        let header_row = Flex::row()
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(title)
-            .with_child(Expanded::new(1., search_box).finish())
-            .with_child(refresh_button)
-            .finish();
-
-        let mut body = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-        body.add_child(header_row);
-
-        // 收起时显示前 N 个(够撑约 1 行 — 实际换行交给 Wrap layout 处理)。
-        const COLLAPSED_LIMIT: usize = 8;
-        let expanded = models_dev::chips_expanded();
-
-        match models_dev::cached() {
-            None => {
-                let catalog_text = if models_dev::last_fetch_failed() {
-                    crate::t!("settings-agent-providers-catalog-load-failed")
-                } else {
-                    crate::t!("settings-agent-providers-loading-catalog")
-                };
-                body.add_child(
-                    Container::new(
-                        Text::new(
-                            catalog_text,
-                            appearance.ui_font_family(),
-                            appearance.ui_font_size(),
-                        )
-                        .with_color(dim_color.into())
-                        .finish(),
-                    )
-                    .with_margin_top(4.)
-                    .finish(),
-                );
-            }
-            Some(catalog) if catalog.is_empty() => {
-                body.add_child(
-                    Container::new(
-                        Text::new(
-                            crate::t!("settings-agent-providers-catalog-empty"),
-                            appearance.ui_font_family(),
-                            appearance.ui_font_size(),
-                        )
-                        .with_color(dim_color.into())
-                        .finish(),
-                    )
-                    .with_margin_top(4.)
-                    .finish(),
-                );
-            }
-            Some(catalog) => {
-                // 按搜索 query 过滤;空 query → 全部条目顺序。
-                let query = models_dev::search_query();
-                let filtered = models_dev::filter_catalog(&catalog, &query);
-                let total = filtered.len();
-                let has_query = !query.trim().is_empty();
-                // 搜索激活时一律展开全部匹配,不做折叠(否则结果数 ≤ 折叠上限就看不全)。
-                let visible_count = if expanded || has_query {
-                    total
-                } else {
-                    COLLAPSED_LIMIT.min(total)
-                };
-
-                let mut wrap = Wrap::row()
-                    .with_spacing(6.)
-                    .with_run_spacing(6.)
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center);
-                {
-                    let mut states = self.quick_add_button_states.borrow_mut();
-                    for (cat_id, cat_provider) in filtered.iter().take(visible_count) {
-                        let label = if cat_provider.name.is_empty() {
-                            cat_id.clone()
-                        } else {
-                            cat_provider.name.clone()
-                        };
-                        let state = states.entry(cat_id.clone()).or_default().clone();
-                        let model_count = cat_provider.models.len();
-                        let display_label = format!("+ {label} ({model_count})");
-                        let chip = Self::render_card_button(
-                            display_label,
-                            state,
-                            AISettingsPageAction::AddProviderFromModelsDev {
-                                catalog_provider_id: cat_id.clone(),
-                            },
-                            appearance,
-                        );
-                        wrap = wrap.with_child(chip);
-                    }
-                }
-                body.add_child(Container::new(wrap.finish()).with_margin_top(4.).finish());
-
-                if has_query && total == 0 {
-                    body.add_child(
-                        Container::new(
-                            Text::new(
-                                crate::t!(
-                                    "settings-agent-providers-no-match",
-                                    query = query.as_str()
-                                ),
-                                appearance.ui_font_family(),
-                                appearance.ui_font_size(),
-                            )
-                            .with_color(dim_color.into())
-                            .finish(),
-                        )
-                        .with_margin_top(4.)
-                        .finish(),
-                    );
-                }
-
-                // 展开/收起按钮(只在无搜索 + catalog 比折叠上限多时才展示)。
-                if !has_query && total > COLLAPSED_LIMIT {
-                    let toggle_label = if expanded {
-                        crate::t!("settings-agent-providers-collapse")
-                    } else {
-                        let count: i64 = (total - COLLAPSED_LIMIT) as i64;
-                        crate::t!("settings-agent-providers-expand-remaining", count = count)
-                    };
-                    let toggle_button = Self::render_card_button(
-                        toggle_label,
-                        self.expand_chips_button_state.clone(),
-                        AISettingsPageAction::ToggleModelsDevChipsExpanded,
-                        appearance,
-                    );
-                    body.add_child(
-                        Container::new(
-                            Flex::row()
-                                .with_main_axis_alignment(MainAxisAlignment::Start)
-                                .with_child(toggle_button)
-                                .finish(),
-                        )
-                        .with_margin_top(6.)
-                        .finish(),
-                    );
-                }
-            }
-        }
-
-        Container::new(body.finish())
-            .with_background(appearance.theme().surface_1())
-            .with_uniform_padding(10.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-            .with_margin_bottom(10.)
-            .finish()
-    }
-}
-
 impl SettingsWidget for AgentProvidersWidget {
     type View = AISettingsPageView;
 
@@ -1914,9 +1697,6 @@ impl SettingsWidget for AgentProvidersWidget {
         .finish();
 
         let mut column = Flex::column().with_child(header).with_child(description);
-
-        // ---- 来自 models.dev 的快速添加 chip 行 ----
-        column.add_child(self.render_models_dev_section(appearance, app));
 
         if providers.is_empty() {
             let empty = Container::new(
