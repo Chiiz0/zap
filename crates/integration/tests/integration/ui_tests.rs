@@ -7,6 +7,7 @@
 use super::integration_tests;
 
 integration_tests! {
+    test_mcp_error_text_layout_in_english_and_chinese,
     test_add_many_sessions,
     test_ctrl_tab_session_switching,
     test_hover_over_menu,

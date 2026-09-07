@@ -1,5 +1,7 @@
 //! Integration tests for bootstrapping logic.
 
+use std::collections::HashMap;
+
 use settings::Setting as _;
 use version_compare::Cmp;
 use warp::cmd_or_ctrl_shift;
@@ -24,7 +26,7 @@ use warp::terminal::session_settings::HonorPS1;
 use warp::terminal::shell::{self, ShellType};
 use warp::workspace::Workspace;
 use warpui_core::clipboard::ClipboardContent;
-use warpui_core::integration::TestStep;
+use warpui_core::integration::{AssertionCallback, TestStep};
 use warpui_core::{ViewHandle, async_assert, async_assert_eq};
 
 use super::{Builder, new_builder};
@@ -201,6 +203,51 @@ pub fn test_paste_and_type_characters_before_bootstrap() -> Builder {
             new_step_with_default_assertions("InfiniShell input should be focused and keep buffered text")
                 .add_assertion(input_editor_is_focused(0))
                 .add_assertion(input_contains_string(0, "this is the pasted textthese are some typed characters".to_owned()))
+        )
+}
+
+fn assert_active_prompt_text(expected: &'static str) -> AssertionCallback {
+    Box::new(move |app, window_id| {
+        let input = single_input_view_for_tab(app, window_id, 0);
+        let prompt = input.read(app, |input, ctx| input.prompt_and_rprompt_text(ctx).0);
+        async_assert_eq!(
+            prompt,
+            expected,
+            "活动提示符应为 {expected:?}，实际为 {prompt:?}"
+        )
+    })
+}
+
+pub fn test_bash_honor_ps1_expands_dynamic_prompt_once() -> Builder {
+    new_builder()
+        .set_should_run_test(|| {
+            let (starter, _) = current_shell_starter_and_version();
+            starter.shell_type() == ShellType::Bash
+        })
+        .with_user_defaults(HashMap::from([(
+            HonorPS1::storage_key().to_owned(),
+            true.to_string(),
+        )]))
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(execute_command_for_single_terminal_in_tab(
+            0,
+            "counter=0; PS1='[$((++counter))]'".to_string(),
+            ExpectedExitStatus::Success,
+            (),
+        ))
+        .with_step(
+            new_step_with_default_assertions("检查设置动态 PS1 后的提示符")
+                .add_named_assertion("动态 PS1 只展开一次", assert_active_prompt_text("[1]")),
+        )
+        .with_step(
+            new_step_with_default_assertions("提交第一个空提示符")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion("动态 PS1 只递增一次", assert_active_prompt_text("[2]")),
+        )
+        .with_step(
+            new_step_with_default_assertions("提交第二个空提示符")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion("动态 PS1 只递增一次", assert_active_prompt_text("[3]")),
         )
 }
 
