@@ -532,12 +532,21 @@ impl Cache {
         let (glyph_id, _) = self
             .glyph_for_char(font_id, 'm', false)
             .expect("we verify in Config::new that the font has an 'm' glyph");
-        let bounds = self
-            .glyph_typographic_bounds(font_id, font_size, glyph_id)
-            .expect(
-            "we verify in Config::new that we can measure the typographic bounds of the 'm' glyph",
-        );
-        bounds.width()
+        // 某些 Windows 字体有 'm' 的水平步进，却没有轮廓包围盒。
+        match self.glyph_typographic_bounds(font_id, font_size, glyph_id) {
+            Ok(bounds) => bounds.width(),
+            Err(_) => match self.glyph_advance(font_id, font_size, glyph_id) {
+                Ok(advance) if advance.x().is_finite() && advance.x() > 0.0 => advance.x(),
+                advance => {
+                    log::warn!(
+                        "[em_width] 'm' glyph has no usable horizontal advance; falling back to \
+                         font_size font_id={font_id:?} font_size={font_size} advance={advance:?}"
+                    );
+                    // 滚动换算会除以 em_width，回退值必须为正。
+                    font_size.max(1.0)
+                }
+            },
+        }
     }
 
     pub(crate) fn remove_glyphs_by_char_entry(&mut self, key: (FontId, char)) {
