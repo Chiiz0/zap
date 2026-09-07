@@ -21,7 +21,9 @@ use watcher::HomeDirectoryWatcherEvent;
 
 use crate::HomeDirectoryWatcher;
 use crate::ai::mcp::parsing::normalize_codex_toml_to_json;
-use crate::ai::mcp::{MCPProvider, ParsedTemplatableMCPServerResult, home_config_file_path};
+use crate::ai::mcp::{
+    MCPProvider, ParsedTemplatableMCPServerResult, home_config_file_path, home_dir,
+};
 use crate::warp_managed_paths_watcher::{
     WarpManagedPathsWatcher, WarpManagedPathsWatcherEvent, warp_managed_mcp_config_path,
 };
@@ -119,13 +121,20 @@ impl RepositorySubscriber for FileMCPSubscriber {
     }
 }
 
+struct InFlightParse {
+    generation: u64,
+    abort_handle: AbortHandle,
+}
+
 /// Model that watches the filesystem for file-based MCP config changes and emits
 /// [`FileMCPWatcherEvent`]s.
 pub struct FileMCPWatcher {
     file_mcp_tx: Sender<FileMCPDetectionMessage>,
-    /// In-flight config parses keyed by source. Starting a replacement aborts
-    /// the previous parse so stale work cannot emit an event.
-    parse_abort_handles: HashMap<(PathBuf, MCPProvider), AbortHandle>,
+    /// 仅当前代际的解析回调可以发布结果；中止不能取消已排队的回调。
+    in_flight_parses: HashMap<(PathBuf, MCPProvider), InFlightParse>,
+    next_parse_generation: u64,
+    /// 初次全局扫描尚未返回结果的配置源，后续配置更新不重新开启扫描。
+    initial_global_pending: Option<HashSet<(PathBuf, MCPProvider)>>,
     /// Watcher handles for home provider subdirectories (e.g. `~/.codex`), keyed by subdir path.
     /// Used to cleanup watchers when the subdir is deleted at runtime.
     home_provider_watchers: HashMap<PathBuf, (ModelHandle<Repository>, SubscriberId)>,
@@ -177,7 +186,7 @@ impl FileMCPWatcher {
             ));
         }
 
-        if let Some(home_dir) = dirs::home_dir() {
+        if let Some(home_dir) = home_dir() {
             for provider in MCPProvider::iter() {
                 if provider == MCPProvider::InfiniShell {
                     continue;
@@ -192,6 +201,9 @@ impl FileMCPWatcher {
                         initial_config_parses.push((config_path, home_dir.clone(), provider));
                     }
                     Some(subdir) => {
+                        if let Some(config_path) = home_config_file_path(provider) {
+                            initial_config_parses.push((config_path, home_dir.clone(), provider));
+                        }
                         // For providers whose home config lives in a subdir (e.g. ~/.codex for Codex)
                         // start watching the subdir for file-based MCP servers, if it exists.
                         let subdir_path = home_dir.join(&subdir);
@@ -211,14 +223,34 @@ impl FileMCPWatcher {
 
         let mut watcher = Self {
             file_mcp_tx,
-            parse_abort_handles: HashMap::new(),
+            in_flight_parses: HashMap::new(),
+            next_parse_generation: 0,
+            initial_global_pending: Some(
+                initial_config_parses
+                    .iter()
+                    .map(|(path, _, provider)| (path.clone(), *provider))
+                    .collect(),
+            ),
             home_provider_watchers,
             project_repo_watchers: HashSet::new(),
         };
         for (config_path, root_path, provider) in initial_config_parses {
             watcher.update_servers_from_config_file(&config_path, root_path, provider, ctx);
         }
+        watcher.complete_initial_global_scan_if_ready(ctx);
         watcher
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_inert() -> Self {
+        Self {
+            file_mcp_tx: async_channel::unbounded().0,
+            in_flight_parses: HashMap::new(),
+            next_parse_generation: 0,
+            initial_global_pending: None,
+            home_provider_watchers: HashMap::new(),
+            project_repo_watchers: HashSet::new(),
+        }
     }
 
     #[cfg(feature = "tui")]
@@ -352,7 +384,7 @@ impl FileMCPWatcher {
         ctx: &mut ModelContext<Self>,
     ) {
         let HomeDirectoryWatcherEvent::HomeFilesChanged(fs_event) = event;
-        let Some(home_dir) = dirs::home_dir() else {
+        let Some(home_dir) = home_dir() else {
             return;
         };
 
@@ -411,12 +443,7 @@ impl FileMCPWatcher {
                             repo_handle.update(ctx, |repo, ctx| repo.stop_watching(id, ctx));
                         }
                         let config_path = home_dir.join(provider.home_config_path());
-                        self.abort_config_parse(&config_path, provider);
-                        ctx.emit(FileMCPWatcherEvent::ConfigRemoved {
-                            config_path,
-                            root_path: home_dir.clone(),
-                            provider,
-                        });
+                        self.remove_config(config_path, home_dir.clone(), provider, ctx);
                     }
                 }
             }
@@ -534,25 +561,91 @@ impl FileMCPWatcher {
         // update. Parse the replacement without transiently removing the
         // last-known-good servers.
         if was_deleted && !was_added {
-            self.abort_config_parse(&config_path, provider);
-            ctx.emit(FileMCPWatcherEvent::ConfigRemoved {
-                config_path: config_path.clone(),
-                root_path: root_path.clone(),
-                provider,
-            });
-        }
-        if was_added {
+            self.remove_config(config_path, root_path, provider, ctx);
+        } else if was_added {
             self.update_servers_from_config_file(&config_path, root_path, provider, ctx);
         }
     }
 
     fn abort_config_parse(&mut self, config_path: &Path, provider: MCPProvider) {
-        if let Some(abort_handle) = self
-            .parse_abort_handles
+        if let Some(in_flight) = self
+            .in_flight_parses
             .remove(&(config_path.to_path_buf(), provider))
         {
-            abort_handle.abort();
+            in_flight.abort_handle.abort();
         }
+    }
+
+    fn remove_config(
+        &mut self,
+        config_path: PathBuf,
+        root_path: PathBuf,
+        provider: MCPProvider,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.abort_config_parse(&config_path, provider);
+        ctx.emit(FileMCPWatcherEvent::ConfigRemoved {
+            config_path: config_path.clone(),
+            root_path,
+            provider,
+        });
+        self.settle_pending_source(&config_path, provider, ctx);
+    }
+
+    fn settle_pending_source(
+        &mut self,
+        config_path: &Path,
+        provider: MCPProvider,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if let Some(pending) = &mut self.initial_global_pending {
+            pending.remove(&(config_path.to_path_buf(), provider));
+        }
+        self.complete_initial_global_scan_if_ready(ctx);
+    }
+
+    fn complete_initial_global_scan_if_ready(&mut self, ctx: &mut ModelContext<Self>) {
+        if self
+            .initial_global_pending
+            .as_ref()
+            .is_some_and(HashSet::is_empty)
+        {
+            self.initial_global_pending = None;
+            ctx.emit(FileMCPWatcherEvent::InitialGlobalScanComplete);
+        }
+    }
+
+    fn take_current_in_flight_parse(
+        &mut self,
+        key: &(PathBuf, MCPProvider),
+        generation: u64,
+    ) -> bool {
+        if self
+            .in_flight_parses
+            .get(key)
+            .is_some_and(|parse| parse.generation == generation)
+        {
+            self.in_flight_parses.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn complete_config_parse(
+        &mut self,
+        key: (PathBuf, MCPProvider),
+        generation: u64,
+        root_path: PathBuf,
+        outcome: FileMCPConfigParseOutcome,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !self.take_current_in_flight_parse(&key, generation) {
+            return;
+        }
+        let (config_path, provider) = key;
+        emit_parse_outcome(outcome, config_path.clone(), root_path, provider, ctx);
+        self.settle_pending_source(&config_path, provider, ctx);
     }
 
     /// Asynchronously reads and parses the MCP configuration file at `config_file_path`,
@@ -568,16 +661,21 @@ impl FileMCPWatcher {
         let key = (config_file_path.clone(), provider);
         let callback_key = key.clone();
         self.abort_config_parse(&config_file_path, provider);
+        let generation = self.next_parse_generation;
+        self.next_parse_generation += 1;
         let parse = ctx.spawn(
             async move { parse_mcp_config_file(&config_file_path, provider).await },
             move |me, outcome, ctx| {
-                me.parse_abort_handles.remove(&callback_key);
-                emit_parse_outcome(outcome, callback_key.0.clone(), root_path, provider, ctx);
-                // Zap 无云端环境准备流程,上游在这里维护的 `cloud_env_pending` 待解析计数
-                // 与随之发出的 `CloudEnvMcpScanComplete` 事件永远不会被触发,故整体移除。
+                me.complete_config_parse(callback_key, generation, root_path, outcome, ctx);
             },
         );
-        self.parse_abort_handles.insert(key, parse.abort_handle());
+        self.in_flight_parses.insert(
+            key,
+            InFlightParse {
+                generation,
+                abort_handle: parse.abort_handle(),
+            },
+        );
     }
 }
 
@@ -818,6 +916,8 @@ pub enum FileMCPWatcherEvent {
     },
     /// A config could not be read or parsed. Consumers should preserve the last-known-good state.
     ConfigError { diagnostic: FileMCPConfigDiagnostic },
+    /// 所有初次全局配置已解析、报错或被移除，配置结果事件先于本事件发出。
+    InitialGlobalScanComplete,
     /// All provider config files for a cloud environment repo have been parsed.
     /// Zap 无云端环境,该事件目前不会被触发,仅保留下游消费方的事件形状。
     CloudEnvMcpScanComplete { repo_path: PathBuf },

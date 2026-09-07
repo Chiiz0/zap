@@ -1,9 +1,19 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::Router;
+use axum::response::IntoResponse;
+use axum::routing::post;
 use rmcp::model::{ErrorCode, ErrorData, Resource, ServerCapabilities, Tool};
+use warp_errors::{AnyhowErrorExt as _, ErrorExt as _};
 
-use super::{query_resources_for, query_tools_for, should_query_resources, should_query_tools};
+use super::{
+    build_client_with_headers, determine_transport, has_caller_supplied_credential,
+    is_oauth_challenge, query_resources_for, query_tools_for, should_query_resources,
+    should_query_tools,
+};
+use crate::oauth::McpAuthenticationError;
 
 /// Build a `ServerCapabilities` with selected capability flags toggled on.
 /// Each `Some(default)` mirrors how rmcp deserializes a capability the
@@ -278,4 +288,266 @@ async fn query_resources_for_calls_list_function_exactly_once() {
     .await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+#[test]
+fn oauth_challenge_requires_resource_metadata_parameter() {
+    assert!(is_oauth_challenge(
+        r#"Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource""#
+    ));
+    assert!(is_oauth_challenge(
+        r#"bearer RESOURCE_METADATA = "https://example.com/metadata""#
+    ));
+    assert!(!is_oauth_challenge("Bearer"));
+    assert!(!is_oauth_challenge(r#"Bearer error="invalid_token""#));
+    assert!(!is_oauth_challenge(r#"Basic realm="mcp""#));
+}
+
+#[test]
+fn oauth_challenge_ignores_parameter_names_inside_quoted_values() {
+    assert!(!is_oauth_challenge(
+        r#"Bearer error_description="mentions \" resource_metadata=\"fake\"", error="invalid_token""#
+    ));
+    assert!(is_oauth_challenge(
+        r#"Bearer error_description="missing resource_metadata", resource_metadata="https://example.com""#
+    ));
+    assert!(!is_oauth_challenge(
+        r#"Bearer error_description="unterminated resource_metadata="https://example.com"#
+    ));
+}
+
+#[test]
+fn only_nonempty_static_auth_headers_count_as_credentials() {
+    assert!(has_caller_supplied_credential(&headers(&[(
+        "aUtHoRiZaTiOn",
+        "Bearer token"
+    )])));
+    assert!(has_caller_supplied_credential(&headers(&[(
+        "X-Api-Key",
+        "token"
+    )])));
+    assert!(has_caller_supplied_credential(&headers(&[(
+        "API-KEY", "token"
+    )])));
+    assert!(!has_caller_supplied_credential(&headers(&[(
+        "Authorization",
+        "   "
+    )])));
+    assert!(!has_caller_supplied_credential(&headers(&[(
+        "Content-Type",
+        "application/json"
+    )])));
+    assert!(!has_caller_supplied_credential(&HashMap::new()));
+}
+
+#[test]
+fn discarded_invalid_headers_do_not_count_as_sent_credentials() {
+    assert!(!has_caller_supplied_credential(&headers(&[(
+        "Authorization",
+        "Bearer invalid\ntoken"
+    )])));
+    assert!(!has_caller_supplied_credential(&headers(&[
+        ("Authorization", "Bearer valid-token"),
+        ("Invalid Header", "value"),
+    ])));
+}
+
+/// 使用真实的本地 HTTP 服务器验证认证分支和未发送请求这一安全边界。
+async fn serve_401(
+    challenges: &'static [&'static str],
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    crate::install_test_crypto_provider();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("测试服务器应能绑定");
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = requests.clone();
+    let app = Router::new().route(
+        "/mcp",
+        post(move || {
+            let requests = handler_requests.clone();
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let mut response = axum::http::StatusCode::UNAUTHORIZED.into_response();
+                for challenge in challenges {
+                    response.headers_mut().append(
+                        axum::http::header::WWW_AUTHENTICATE,
+                        axum::http::HeaderValue::from_static(challenge),
+                    );
+                }
+                response
+            }
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, requests, server)
+}
+
+fn authentication_error(error: &rmcp::RmcpError) -> &McpAuthenticationError {
+    let rmcp::RmcpError::TransportCreation { error, .. } = error else {
+        panic!("应保留传输层认证错误：{error}");
+    };
+    error
+        .downcast_ref::<McpAuthenticationError>()
+        .expect("应保留可分类的认证错误")
+}
+
+#[tokio::test]
+async fn bare_401_with_configured_credential_reports_rejection_not_oauth() {
+    let (url, requests, server) = serve_401(&[]).await;
+
+    let error = determine_transport(
+        "static-credential-server".to_string(),
+        &url,
+        &headers(&[("Authorization", "Bearer rejected-private-token")]),
+        None,
+    )
+    .await
+    .err()
+    .expect("被拒绝的凭据应阻止连接");
+
+    assert!(matches!(
+        authentication_error(&error),
+        McpAuthenticationError::CredentialsRejected
+    ));
+    assert!(!format!("{error:?}").contains("rejected-private-token"));
+    assert!(!authentication_error(&error).is_actionable());
+    assert!(!anyhow::Error::new(error).is_actionable());
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn plain_bearer_challenge_with_api_key_reports_rejection() {
+    let (url, requests, server) = serve_401(&[r#"Bearer error="invalid_token""#]).await;
+
+    let error = determine_transport(
+        "api-key-server".to_string(),
+        &url,
+        &headers(&[("X-Api-Key", "rejected-api-key")]),
+        None,
+    )
+    .await
+    .err()
+    .expect("普通 Bearer challenge 不应触发 OAuth");
+
+    assert!(matches!(
+        authentication_error(&error),
+        McpAuthenticationError::CredentialsRejected
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn oauth_challenge_in_repeated_header_overrides_static_credential_rejection() {
+    let (url, requests, server) = serve_401(&[
+        r#"Bearer error="invalid_token""#,
+        r#"Bearer resource_metadata = "https://example.com/metadata""#,
+    ])
+    .await;
+
+    let error = determine_transport(
+        "oauth-server".to_string(),
+        &url,
+        &headers(&[("Authorization", "Bearer expired-token")]),
+        None,
+    )
+    .await
+    .err()
+    .expect("应走到缺少认证上下文的 OAuth 分支");
+
+    assert!(matches!(
+        authentication_error(&error),
+        McpAuthenticationError::OAuthUnavailable
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn bare_401_without_configured_credentials_still_attempts_oauth() {
+    let (url, requests, server) = serve_401(&[]).await;
+
+    let error = determine_transport("oauth-server".to_string(), &url, &HashMap::new(), None)
+        .await
+        .err()
+        .expect("应走到缺少认证上下文的 OAuth 分支");
+
+    assert!(matches!(
+        authentication_error(&error),
+        McpAuthenticationError::OAuthUnavailable
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unresolved_header_secret_fails_before_sending_a_request() {
+    let (url, requests, server) = serve_401(&[]).await;
+
+    let error = determine_transport(
+        "unresolved-secret-server".to_string(),
+        &url,
+        &headers(&[(
+            "Authorization",
+            "Bearer sensitive-prefix-{{MISSING_SECRET}}",
+        )]),
+        None,
+    )
+    .await
+    .err()
+    .expect("未解析的密钥应阻止预检请求");
+
+    let McpAuthenticationError::UnresolvedHeaderSecrets { header, secrets } =
+        authentication_error(&error)
+    else {
+        panic!("应报告未解析密钥：{error}");
+    };
+    assert_eq!(header, "Authorization");
+    assert_eq!(secrets, &["MISSING_SECRET"]);
+    assert!(!format!("{error:?}").contains("sensitive-prefix"));
+    assert!(!format!("{error}").contains("MISSING_SECRET"));
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[test]
+fn custom_headers_also_reject_unresolved_secrets() {
+    let error = build_client_with_headers(&headers(&[(
+        "X-Custom-Credential",
+        "{{SECOND}}/{{FIRST}}/{{FIRST}}",
+    )]))
+    .expect_err("自定义头也必须检查密钥引用");
+
+    let McpAuthenticationError::UnresolvedHeaderSecrets { header, secrets } =
+        authentication_error(&error)
+    else {
+        panic!("应报告未解析密钥：{error}");
+    };
+    assert_eq!(header, "X-Custom-Credential");
+    assert_eq!(secrets, &["FIRST", "SECOND"]);
+}
+
+#[test]
+fn header_json_and_literal_braces_are_not_secret_references() {
+    crate::install_test_crypto_provider();
+    assert!(
+        build_client_with_headers(&headers(&[
+            ("X-Json", r#"{"kind":"test","nested":{"value":1}}"#),
+            ("X-Literal", "{not-a-template}"),
+            ("Authorization", "Bearer resolved-token"),
+        ]))
+        .is_ok()
+    );
 }

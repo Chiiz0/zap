@@ -878,8 +878,9 @@ fn test_apply_secrets_resolves_explicit_handlebars_in_env_value() {
     );
 
     let secrets = make_secrets(vec![("secret_one", "real_api_key_value")]);
-    installation.apply_secrets(&secrets);
+    let unresolved = installation.apply_secrets(&secrets);
 
+    assert!(unresolved.is_empty());
     assert_eq!(
         installation.variable_values()["API_KEY"].value,
         "real_api_key_value"
@@ -898,8 +899,9 @@ fn test_apply_secrets_resolves_bearer_header_with_handlebars() {
     );
 
     let secrets = make_secrets(vec![("my_token", "tok_abc123")]);
-    installation.apply_secrets(&secrets);
+    let unresolved = installation.apply_secrets(&secrets);
 
+    assert!(unresolved.is_empty());
     assert_eq!(
         installation.variable_values()["Authorization"].value,
         "Bearer tok_abc123"
@@ -973,7 +975,7 @@ fn test_apply_secrets_mixed_explicit_and_implicit() {
 }
 
 #[test]
-fn test_apply_secrets_missing_secret_leaves_placeholder() {
+fn test_apply_secrets_missing_secret_reports_reference_name() {
     // If the referenced secret doesn't exist, the {{...}} placeholder
     // should remain in the value.
     let mut installation = create_test_installation(
@@ -983,10 +985,53 @@ fn test_apply_secrets_missing_secret_leaves_placeholder() {
     );
 
     let secrets = make_secrets(vec![]);
-    installation.apply_secrets(&secrets);
+    let unresolved = installation.apply_secrets(&secrets);
 
+    assert_eq!(unresolved, vec!["nonexistent_secret"]);
     assert_eq!(
         installation.variable_values()["API_KEY"].value,
         "{{nonexistent_secret}}"
+    );
+}
+
+#[test]
+fn test_apply_secrets_reports_sorted_unique_names_without_secret_values() {
+    let mut installation = create_test_installation(
+        "sse-server",
+        r#"{"sse-server":{"url":"https://example.com","headers":{"Authorization":"{{Authorization}}","X-Api-Key":"{{X-Api-Key}}"}}}"#,
+        vec![
+            ("Authorization", "Bearer {{resolved}}-{{second_missing}}"),
+            ("X-Api-Key", "{{second_missing}}/{{first_missing}}"),
+        ],
+    );
+    let secrets = make_secrets(vec![("resolved", "private-secret-value")]);
+
+    let unresolved = installation.apply_secrets(&secrets);
+
+    assert_eq!(unresolved, vec!["first_missing", "second_missing"]);
+    assert_eq!(
+        installation.variable_values()["Authorization"].value,
+        "Bearer private-secret-value-{{second_missing}}"
+    );
+}
+
+#[test]
+fn test_apply_secrets_reports_nonraw_secret_as_unresolved() {
+    let mut installation = create_test_installation(
+        "test-server",
+        r#"{"test-server":{"command":"npx","env":{"API_KEY":"{{API_KEY}}"}}}"#,
+        vec![("API_KEY", "{{provider_credentials}}")],
+    );
+    let secrets = HashMap::from([(
+        "provider_credentials".to_string(),
+        ManagedSecretValue::anthropic_api_key("private-provider-key"),
+    )]);
+
+    let unresolved = installation.apply_secrets(&secrets);
+
+    assert_eq!(unresolved, vec!["provider_credentials"]);
+    assert_eq!(
+        installation.variable_values()["API_KEY"].value,
+        "{{provider_credentials}}"
     );
 }

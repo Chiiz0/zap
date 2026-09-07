@@ -28,7 +28,7 @@ fn setup_app(app: &mut App) -> warpui::ModelHandle<FileBasedMCPManager> {
     app.add_singleton_model(RepoMetadataModel::new);
     app.add_singleton_model(HomeDirectoryWatcher::new_for_test);
     app.add_singleton_model(WarpManagedPathsWatcher::new_for_testing);
-    app.add_singleton_model(FileMCPWatcher::new);
+    app.add_singleton_model(|_| FileMCPWatcher::new_inert());
     app.add_singleton_model(AISettings::new_with_defaults);
     app.add_singleton_model(|_| AuthStateProvider::new_for_test());
     app.add_singleton_model(UserWorkspaces::default_mock);
@@ -48,6 +48,7 @@ struct ManagerEvents {
     spawned_uuids: Vec<Uuid>,
     despawned_uuids: Vec<Uuid>,
     scan_completions: Vec<ScanCompletion>,
+    initial_global_scan_completions: Vec<Vec<Uuid>>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +103,10 @@ fn subscribe_events(
             FileBasedMCPManagerEvent::PurgeCredentials { .. }
             | FileBasedMCPManagerEvent::ServersChanged
             | FileBasedMCPManagerEvent::ConfigDiagnosticChanged => {}
+            FileBasedMCPManagerEvent::InitialGlobalMcpScanComplete { wait_server_uuids } => {
+                me.initial_global_scan_completions
+                    .push(wait_server_uuids.clone());
+            }
             FileBasedMCPManagerEvent::CloudEnvMcpScanComplete {
                 repo_path,
                 detected_servers,
@@ -480,7 +485,7 @@ fn test_global_warp_server_from_managed_home_root_always_spawns() {
 #[test]
 fn test_global_non_warp_server_respects_toggle() {
     let _flag_guard = FeatureFlag::FileBasedMcp.override_enabled(true);
-    let Some(home_dir) = dirs::home_dir() else {
+    let Some(home_dir) = super::home_dir() else {
         // Skip on platforms where a home dir isn't available (shouldn't happen on
         // our supported platforms, but guard to avoid false failures).
         return;
@@ -534,7 +539,7 @@ fn test_global_non_warp_server_respects_toggle() {
 #[test]
 fn tui_global_third_party_servers_never_auto_start() {
     let _flag_guard = FeatureFlag::FileBasedMcp.override_enabled(true);
-    let Some(home_dir) = dirs::home_dir() else {
+    let Some(home_dir) = super::home_dir() else {
         return;
     };
     let parsed =
@@ -567,6 +572,89 @@ fn tui_global_third_party_servers_never_auto_start() {
 }
 
 #[test]
+fn initial_global_scan_preserves_snapshot_for_late_subscribers() {
+    let _flag_guard = FeatureFlag::FileBasedMcp.override_enabled(true);
+    let config = warp_managed_mcp_config_path().expect("测试需要全局 MCP 路径");
+    App::test((), |mut app| async move {
+        let manager = setup_app(&mut app);
+        let events = subscribe_events(&mut app, &manager);
+        manager.read(&app, |manager, _| {
+            assert_eq!(manager.initial_global_scan_result(), None)
+        });
+        manager.update(&mut app, |manager, ctx| {
+            manager.defer_global_warp_autostart = false;
+            manager.apply_parsed_servers(
+                config.root_path.clone(),
+                MCPProvider::InfiniShell,
+                parse_mcp_json(r#"{"initial": {"command": "initial-server"}}"#),
+                ctx,
+            );
+        });
+        let initial_uuid = events.read(&app, |events, _| events.spawned_uuids[0]);
+        FileMCPWatcher::handle(&app).update(&mut app, |_, ctx| {
+            ctx.emit(FileMCPWatcherEvent::InitialGlobalScanComplete);
+        });
+
+        let late_events = subscribe_events(&mut app, &manager);
+        manager.read(&app, |manager, _| {
+            assert_eq!(
+                manager.initial_global_scan_result(),
+                Some(vec![initial_uuid])
+            );
+        });
+        manager.update(&mut app, |manager, ctx| {
+            manager.apply_parsed_servers(
+                config.root_path,
+                MCPProvider::InfiniShell,
+                parse_mcp_json(r#"{"replacement": {"command": "replacement-server"}}"#),
+                ctx,
+            );
+        });
+        FileMCPWatcher::handle(&app).update(&mut app, |_, ctx| {
+            ctx.emit(FileMCPWatcherEvent::InitialGlobalScanComplete);
+        });
+        manager.read(&app, |manager, _| {
+            assert_eq!(
+                manager.initial_global_scan_result(),
+                Some(vec![initial_uuid])
+            );
+        });
+        events.read(&app, |events, _| {
+            assert_eq!(events.initial_global_scan_completions, [vec![initial_uuid]]);
+        });
+        late_events.read(&app, |events, _| {
+            assert!(events.initial_global_scan_completions.is_empty())
+        });
+    });
+}
+
+#[test]
+fn initial_global_scan_does_not_wait_for_unapproved_third_party_servers() {
+    let _flag_guard = FeatureFlag::FileBasedMcp.override_enabled(true);
+    App::test((), |mut app| async move {
+        let manager = setup_app(&mut app);
+        let events = subscribe_events(&mut app, &manager);
+        set_file_based_mcp_enabled(&mut app, false);
+        manager.update(&mut app, |manager, ctx| {
+            manager.defer_global_warp_autostart = false;
+            manager.apply_parsed_servers(
+                super::home_dir().expect("测试需要用户目录"),
+                MCPProvider::Claude,
+                parse_mcp_json(r#"{"unapproved": {"command": "unapproved-server"}}"#),
+                ctx,
+            );
+        });
+        FileMCPWatcher::handle(&app).update(&mut app, |_, ctx| {
+            ctx.emit(FileMCPWatcherEvent::InitialGlobalScanComplete);
+        });
+        manager.read(&app, |manager, _| {
+            assert_eq!(manager.initial_global_scan_result(), Some(Vec::new()));
+        });
+        events.read(&app, |events, _| assert!(events.spawned_uuids.is_empty()));
+    });
+}
+
+#[test]
 fn tui_global_warp_servers_start_only_after_activation() {
     let _flag_guard = FeatureFlag::FileBasedMcp.override_enabled(true);
     let Some(warp_mcp_config_path) = warp_managed_mcp_config_path() else {
@@ -592,6 +680,13 @@ fn tui_global_warp_servers_start_only_after_activation() {
             assert!(events.spawned_uuids.is_empty());
         });
 
+        FileMCPWatcher::handle(&app).update(&mut app, |_, ctx| {
+            ctx.emit(FileMCPWatcherEvent::InitialGlobalScanComplete);
+        });
+        manager.read(&app, |manager, _| {
+            assert_eq!(manager.initial_global_scan_result(), Some(Vec::new()));
+        });
+
         manager.update(&mut app, |manager, ctx| {
             manager.activate_global_warp_servers(ctx);
         });
@@ -601,6 +696,9 @@ fn tui_global_warp_servers_start_only_after_activation() {
                 1,
                 "post-login activation should start TUI InfiniShell-global servers"
             );
+        });
+        manager.read(&app, |manager, _| {
+            assert_eq!(manager.initial_global_scan_result(), Some(Vec::new()));
         });
     });
 }
@@ -747,7 +845,7 @@ fn test_auto_started_cloud_scan_uuids_are_in_wait_set() {
 #[test]
 fn test_server_referenced_from_both_global_and_project_is_global() {
     let _flag_guard = FeatureFlag::FileBasedMcp.override_enabled(true);
-    let Some(home_dir) = dirs::home_dir() else {
+    let Some(home_dir) = super::home_dir() else {
         return;
     };
     let repo_path = PathBuf::from("/tmp/warp-test-repo-shared");
@@ -797,7 +895,7 @@ fn test_server_referenced_from_both_global_and_project_is_global() {
 
 #[test]
 fn source_snapshots_preserve_provenance_scope_spawn_root_and_hash_lookup() {
-    let Some(home_dir) = dirs::home_dir() else {
+    let Some(home_dir) = super::home_dir() else {
         return;
     };
     let repo_path = PathBuf::from("/tmp/warp-test-provenance-repo");

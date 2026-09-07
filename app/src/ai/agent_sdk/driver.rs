@@ -57,6 +57,8 @@ use crate::terminal::cli_agent_sessions::{
 
 pub(crate) mod harness;
 mod harness_output_monitor;
+#[cfg(feature = "local_fs")]
+mod mcp_startup;
 pub(super) mod output;
 pub(crate) mod terminal;
 
@@ -265,6 +267,8 @@ pub enum AgentDriverError {
     MCPJsonParseError(String),
     #[error("MCP server configuration is missing required variables")]
     MCPMissingVariables,
+    #[error("{0}")]
+    MCPMissingSecrets(String),
     #[error("Agent profile \"{0}\" not found")]
     ProfileError(String),
     #[error("Local user state is unavailable. Restart InfiniShell and try again.")]
@@ -770,7 +774,15 @@ impl AgentDriver {
 
         // Inject secrets into the ephemeral MCP server installations.
         for installation in installations.iter_mut() {
-            installation.apply_secrets(&self.secrets);
+            let unresolved = installation.apply_secrets(&self.secrets);
+            if !unresolved.is_empty() {
+                return Either::Right(future::ready(Err(AgentDriverError::MCPMissingSecrets(
+                    crate::t!(
+                        "mcp-startup-missing-secrets",
+                        secrets = unresolved.join(", ")
+                    ),
+                ))));
+            }
         }
 
         let (tx, rx) = oneshot::channel();
@@ -830,89 +842,6 @@ impl AgentDriver {
                 Err(TimeoutError) => {
                     log::error!("Timed out waiting for ephemeral MCP servers to start");
                     Err(AgentDriverError::MCPStartupFailed)
-                }
-            }
-        })
-    }
-
-    /// Wait for all file-based MCP servers with the given UUIDs to reach a terminal state
-    /// (`Running` or `FailedToStart`). Non-fatal: always completes without returning an error.
-    ///
-    /// **Sequencing note:** `AgentDriver` supports only one active subscription to
-    /// [`TemplatableMCPServerManager`] at a time. This function, [`Self::start_mcp_servers`],
-    /// and [`Self::start_ephemeral_mcp_servers`] must therefore run sequentially, never
-    /// concurrently.
-    fn wait_for_file_based_mcps_running(
-        &self,
-        uuids: Vec<Uuid>,
-        ctx: &mut ModelContext<Self>,
-    ) -> impl Future<Output = ()> {
-        // Filter out UUIDs that have already reached a terminal state.
-        let mut pending_uuids: HashSet<Uuid> = {
-            let templatable_manager = TemplatableMCPServerManager::as_ref(ctx);
-            uuids
-                .into_iter()
-                .filter(|uuid| {
-                    !matches!(
-                        templatable_manager.get_server_state(*uuid),
-                        Some(MCPServerState::Running) | Some(MCPServerState::FailedToStart)
-                    )
-                })
-                .collect()
-        };
-
-        if pending_uuids.is_empty() {
-            log::info!("All file-based MCP servers are already running; proceeding");
-            return Either::Right(future::ready(()));
-        }
-
-        let (tx, rx) = oneshot::channel::<()>();
-        let mut tx = Some(tx);
-
-        let templatable_manager_handle = TemplatableMCPServerManager::handle(ctx);
-        let manager_clone = templatable_manager_handle.clone();
-
-        // Zap:同上,`ModelContext::subscribe_to_model` 回调为 4 参,补回 handle 形参。
-        ctx.subscribe_to_model(
-            &templatable_manager_handle,
-            move |_me, _handle, event, ctx| {
-                if let TemplatableMCPServerManagerEvent::StateChanged { uuid, state } = event {
-                    if !pending_uuids.contains(uuid) {
-                        return;
-                    }
-                    match state {
-                        MCPServerState::Running | MCPServerState::FailedToStart => {
-                            pending_uuids.remove(uuid);
-                        }
-                        _ => {
-                            return;
-                        }
-                    }
-                    if pending_uuids.is_empty() {
-                        log::info!(
-                            "All file-based MCP servers reached a terminal state; proceeding"
-                        );
-                        if let Some(sender) = tx.take() {
-                            let _ = sender.send(());
-                        }
-                        ctx.unsubscribe_from_model(&manager_clone);
-                    }
-                }
-            },
-        );
-
-        Either::Left(async move {
-            match rx.with_timeout(MCP_SERVER_STARTUP_TIMEOUT).await {
-                Ok(Ok(())) => {}
-                Ok(Err(Canceled)) => {
-                    log::warn!(
-                        "File-based MCP server readiness subscription dropped early; proceeding"
-                    );
-                }
-                Err(TimeoutError) => {
-                    log::warn!(
-                        "Timed out waiting for file-based MCP servers to reach a terminal state; proceeding without"
-                    );
                 }
             }
         })
@@ -1004,6 +933,9 @@ impl AgentDriver {
         // Run the harness with a prompt
         match task.harness {
             HarnessKind::Oz => {
+                #[cfg(feature = "local_fs")]
+                mcp_startup::await_initial_global_startup(&foreground, Duration::from_secs(20))
+                    .await?;
                 let conversation_status = foreground
                     .spawn(move |me, ctx| me.execute_run(task.prompt, ctx))
                     .await?

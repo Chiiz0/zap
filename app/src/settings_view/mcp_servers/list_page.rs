@@ -135,6 +135,7 @@ impl MCPServersListPageView {
                     // 卡片刷新已由上面三个事件覆盖,这两个通知类事件不再重复刷新
                     // (避免刷新过程中再次触发订阅回调)。
                     FileBasedMCPManagerEvent::ServersChanged
+                    | FileBasedMCPManagerEvent::InitialGlobalMcpScanComplete { .. }
                     | FileBasedMCPManagerEvent::ConfigDiagnosticChanged => {}
                     // Zap 无云端环境,该事件不会被触发。
                     FileBasedMCPManagerEvent::CloudEnvMcpScanComplete { .. } => {}
@@ -148,7 +149,8 @@ impl MCPServersListPageView {
                         me.refresh_file_based_server_cards(ctx);
                     }
                     // 解析失败时保留上一次的良好状态,不清空卡片列表。
-                    FileMCPWatcherEvent::ConfigError { .. } => {}
+                    FileMCPWatcherEvent::ConfigError { .. }
+                    | FileMCPWatcherEvent::InitialGlobalScanComplete => {}
                     // Zap 无云端环境,该事件不会被触发。
                     FileMCPWatcherEvent::CloudEnvMcpScanComplete { .. } => {}
                 });

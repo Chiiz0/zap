@@ -6,11 +6,12 @@ use futures::stream::AbortHandle;
 use repo_metadata::repositories::RepoDetectionSource;
 use repo_metadata::{RepositoryUpdate, TargetFile};
 use settings::SettingsMode;
+use warpui::{App, Entity, ModelHandle};
 
 use super::{
-    FileMCPConfigDiagnosticKind, FileMCPConfigParseOutcome, FileMCPWatcher, config_change_flags,
-    home_subdir_to_watch, parse_mcp_config_file, providers_in_scope, should_watch_repository,
-    substitute_env_vars,
+    FileMCPConfigDiagnostic, FileMCPConfigDiagnosticKind, FileMCPConfigParseOutcome,
+    FileMCPWatcher, FileMCPWatcherEvent, InFlightParse, config_change_flags, home_subdir_to_watch,
+    parse_mcp_config_file, providers_in_scope, should_watch_repository, substitute_env_vars,
 };
 use crate::ai::mcp::MCPProvider;
 
@@ -23,22 +24,194 @@ fn cleanup_env_vars(vars: &[&str]) {
 
 #[test]
 fn abort_config_parse_cancels_and_removes_inflight_task() {
-    let (file_mcp_tx, _file_mcp_rx) = async_channel::unbounded();
     let config_path = PathBuf::from("/tmp/.mcp.json");
     let key = (config_path.clone(), MCPProvider::InfiniShell);
     let (abort_handle, _abort_registration) = AbortHandle::new_pair();
     let observed_handle = abort_handle.clone();
     let mut watcher = FileMCPWatcher {
-        file_mcp_tx,
-        parse_abort_handles: HashMap::from([(key.clone(), abort_handle)]),
-        home_provider_watchers: HashMap::new(),
-        project_repo_watchers: HashSet::new(),
+        in_flight_parses: HashMap::from([(
+            key.clone(),
+            InFlightParse {
+                generation: 0,
+                abort_handle,
+            },
+        )]),
+        ..FileMCPWatcher::new_inert()
     };
 
     watcher.abort_config_parse(&config_path, MCPProvider::InfiniShell);
 
     assert!(observed_handle.is_aborted());
-    assert!(!watcher.parse_abort_handles.contains_key(&key));
+    assert!(!watcher.in_flight_parses.contains_key(&key));
+}
+
+#[derive(Default)]
+struct ScanEvents(Vec<&'static str>);
+
+impl Entity for ScanEvents {
+    type Event = ();
+}
+
+fn record_scan_events(
+    app: &mut App,
+    watcher: &ModelHandle<FileMCPWatcher>,
+) -> ModelHandle<ScanEvents> {
+    let events = app.add_model(|_| ScanEvents::default());
+    events.update(app, |_, ctx| {
+        ctx.subscribe_to_model(watcher, |events, _, event, _| {
+            events.0.push(match event {
+                FileMCPWatcherEvent::ConfigParsed { .. } => "parsed",
+                FileMCPWatcherEvent::ConfigRemoved { .. } => "removed",
+                FileMCPWatcherEvent::ConfigError { .. } => "error",
+                FileMCPWatcherEvent::InitialGlobalScanComplete => "complete",
+                FileMCPWatcherEvent::CloudEnvMcpScanComplete { .. } => "cloud",
+            });
+        });
+    });
+    events
+}
+
+#[test]
+fn initial_global_scan_ignores_superseded_parse_callbacks() {
+    App::test((), |mut app| async move {
+        let key = (
+            PathBuf::from("/home/test/.claude.json"),
+            MCPProvider::Claude,
+        );
+        let watcher = app.add_model(|_| FileMCPWatcher {
+            initial_global_pending: Some(HashSet::from([key.clone()])),
+            in_flight_parses: HashMap::from([(
+                key.clone(),
+                InFlightParse {
+                    generation: 2,
+                    abort_handle: AbortHandle::new_pair().0,
+                },
+            )]),
+            ..FileMCPWatcher::new_inert()
+        });
+        let events = record_scan_events(&mut app, &watcher);
+
+        watcher.update(&mut app, |watcher, ctx| {
+            watcher.complete_config_parse(
+                key.clone(),
+                1,
+                PathBuf::from("/home/test"),
+                FileMCPConfigParseOutcome::Missing,
+                ctx,
+            );
+        });
+        events.read(&app, |events, _| assert!(events.0.is_empty()));
+        watcher.read(&app, |watcher, _| {
+            assert_eq!(watcher.in_flight_parses.get(&key).unwrap().generation, 2);
+            assert_eq!(watcher.initial_global_pending.as_ref().unwrap().len(), 1);
+        });
+
+        watcher.update(&mut app, |watcher, ctx| {
+            watcher.complete_config_parse(
+                key,
+                2,
+                PathBuf::from("/home/test"),
+                FileMCPConfigParseOutcome::Parsed(Vec::new()),
+                ctx,
+            );
+        });
+        events.read(&app, |events, _| {
+            assert_eq!(events.0, ["parsed", "complete"])
+        });
+    });
+}
+
+#[test]
+fn initial_global_scan_waits_for_last_source_and_settles_parse_errors() {
+    App::test((), |mut app| async move {
+        let key = (
+            PathBuf::from("/home/test/.claude.json"),
+            MCPProvider::Claude,
+        );
+        let other = (
+            PathBuf::from("/home/test/.codex/config.toml"),
+            MCPProvider::Codex,
+        );
+        let watcher = app.add_model(|_| FileMCPWatcher {
+            initial_global_pending: Some(HashSet::from([key.clone(), other.clone()])),
+            in_flight_parses: HashMap::from([(
+                key.clone(),
+                InFlightParse {
+                    generation: 1,
+                    abort_handle: AbortHandle::new_pair().0,
+                },
+            )]),
+            ..FileMCPWatcher::new_inert()
+        });
+        let events = record_scan_events(&mut app, &watcher);
+        watcher.update(&mut app, |watcher, ctx| {
+            let diagnostic = FileMCPConfigDiagnostic {
+                config_path: key.0.clone(),
+                provider: key.1,
+                kind: FileMCPConfigDiagnosticKind::Parse,
+                message: "invalid config".to_owned(),
+            };
+            watcher.complete_config_parse(
+                key,
+                1,
+                PathBuf::from("/home/test"),
+                FileMCPConfigParseOutcome::Error(diagnostic),
+                ctx,
+            );
+        });
+        events.read(&app, |events, _| assert_eq!(events.0, ["error"]));
+        watcher.update(&mut app, |watcher, ctx| {
+            watcher.remove_config(other.0.clone(), PathBuf::from("/home/test"), other.1, ctx);
+        });
+        events.read(&app, |events, _| {
+            assert_eq!(events.0, ["error", "removed", "complete"])
+        });
+
+        watcher.update(&mut app, |watcher, ctx| {
+            watcher.remove_config(other.0, PathBuf::from("/home/test"), other.1, ctx);
+        });
+        events.read(&app, |events, _| {
+            assert_eq!(events.0, ["error", "removed", "complete", "removed"])
+        });
+    });
+}
+
+#[test]
+fn initial_global_scan_removal_prevents_late_parse_from_restoring_servers() {
+    App::test((), |mut app| async move {
+        let key = (
+            PathBuf::from("/home/test/.claude.json"),
+            MCPProvider::Claude,
+        );
+        let watcher = app.add_model(|_| FileMCPWatcher {
+            initial_global_pending: Some(HashSet::from([key.clone()])),
+            in_flight_parses: HashMap::from([(
+                key.clone(),
+                InFlightParse {
+                    generation: 1,
+                    abort_handle: AbortHandle::new_pair().0,
+                },
+            )]),
+            ..FileMCPWatcher::new_inert()
+        });
+        let events = record_scan_events(&mut app, &watcher);
+        watcher.update(&mut app, |watcher, ctx| {
+            watcher.remove_config(key.0.clone(), PathBuf::from("/home/test"), key.1, ctx);
+            watcher.complete_config_parse(
+                key,
+                1,
+                PathBuf::from("/home/test"),
+                FileMCPConfigParseOutcome::Parsed(Vec::new()),
+                ctx,
+            );
+        });
+        events.read(&app, |events, _| {
+            assert_eq!(events.0, ["removed", "complete"])
+        });
+        watcher.read(&app, |watcher, _| {
+            assert!(watcher.in_flight_parses.is_empty())
+        });
+    });
 }
 
 #[test]

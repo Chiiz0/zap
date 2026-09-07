@@ -505,10 +505,21 @@ pub enum MCPServerUpdate {
     },
 }
 
+/// Windows 的 dirs::home_dir 不读取 HOME；测试使用显式重定向保证隔离。
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    dirs::home_dir()
+}
+
 pub(crate) fn home_config_file_path(provider: MCPProvider) -> Option<PathBuf> {
     match provider {
         MCPProvider::InfiniShell => warp_core::paths::warp_home_mcp_config_file_path(),
-        _ => dirs::home_dir().map(|home_dir| home_dir.join(provider.home_config_path())),
+        _ => home_dir().map(|home_dir| home_dir.join(provider.home_config_path())),
     }
 }
 

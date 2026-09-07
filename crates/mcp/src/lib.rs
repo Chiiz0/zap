@@ -7,6 +7,12 @@ pub mod sse_transport;
 
 use uuid::Uuid;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+fn install_test_crypto_provider() {
+    // 独立 crate 测试不会经过 app 启动入口，需显式安装同一个 TLS provider。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Information about a single connected MCP server.
 pub struct TemplatableMCPServerInfo {
     name: String,

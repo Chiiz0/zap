@@ -11,6 +11,7 @@ use std::future::Future;
 use cfg_if::cfg_if;
 use cloud_object_models::{StaticEnvVar, TransportType};
 use futures::FutureExt as _;
+use handlebars::get_arguments;
 use rmcp::ServiceExt as _;
 use rmcp::transport::ConfigureCommandExt as _;
 use simple_logger::SimpleLogger;
@@ -19,6 +20,7 @@ use uuid::Uuid;
 use warp_errors::report_error;
 
 use super::TemplatableMCPServerInfo;
+use crate::oauth::McpAuthenticationError;
 
 type ReqwestHttpTransport = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
 type ReqwestSseTransport = crate::sse_transport::SseClientTransport<reqwest::Client>;
@@ -77,11 +79,88 @@ fn build_header_map(headers: &HashMap<String, String>) -> reqwest::header::Heade
     headers.try_into().unwrap_or_default()
 }
 
+/// 常见的静态凭据头决定无 OAuth challenge 的 401 是否属于令牌被拒绝。
+fn has_caller_supplied_credential(headers: &HashMap<String, String>) -> bool {
+    // 与构建请求使用同一份头部转换规则，忽略被丢弃的无效配置。
+    let header_map = build_header_map(headers);
+    ["authorization", "x-api-key", "api-key"]
+        .iter()
+        .any(|name| {
+            header_map
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
+/// 只检查参数名，避免错误描述中提及 resource_metadata 时误触发 OAuth。
+fn is_oauth_challenge(www_authenticate: &str) -> bool {
+    challenge_parameter_names(www_authenticate)
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("resource_metadata"))
+}
+
+/// 跳过带转义的引号值，保留多 challenge 中真正的参数名。
+fn challenge_parameter_names(www_authenticate: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = www_authenticate;
+
+    while let Some(equals) = rest.find('=') {
+        let name = rest[..equals]
+            .trim_end()
+            .rsplit([',', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !name.is_empty() {
+            names.push(name);
+        }
+
+        let after_equals = rest[equals + 1..].trim_start();
+        rest = match after_equals.strip_prefix('"') {
+            Some(unquoted) => {
+                let mut escaped = false;
+                let closing_quote = unquoted.char_indices().find_map(|(index, character)| {
+                    if escaped {
+                        escaped = false;
+                        return None;
+                    }
+                    if character == '\\' {
+                        escaped = true;
+                        return None;
+                    }
+                    (character == '"').then_some(index)
+                });
+                closing_quote.map_or("", |closing| &unquoted[closing + 1..])
+            }
+            None => match after_equals.find(',') {
+                Some(comma) => &after_equals[comma + 1..],
+                None => "",
+            },
+        };
+    }
+
+    names
+}
+
 /// Builds a reqwest client with custom headers for MCP HTTP/SSE connections.
 #[allow(clippy::result_large_err)]
 pub fn build_client_with_headers(
     headers: &HashMap<String, String>,
 ) -> Result<reqwest::Client, rmcp::RmcpError> {
+    // 与安装模板使用同一个解析器；普通 JSON 大括号不属于密钥引用。
+    for (header, value) in headers {
+        let mut secrets = get_arguments(value);
+        if !secrets.is_empty() {
+            secrets.sort();
+            return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
+                McpAuthenticationError::UnresolvedHeaderSecrets {
+                    header: header.clone(),
+                    secrets,
+                },
+            ));
+        }
+    }
     let header_map = build_header_map(headers);
 
     reqwest::Client::builder()
@@ -361,13 +440,25 @@ async fn determine_transport(
             "Unexpected status code: {status}"
         ))
     }
-    match send_initialize_request(url, headers, None).await? {
+    let preflight = send_initialize_request(url, headers, None).await?;
+    match preflight.status {
         StatusCode::OK => Ok(Transport::Http(None)),
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => Ok(Transport::Sse(None)),
         StatusCode::UNAUTHORIZED => {
+            // 已发送静态凭据但服务器未给出资源元数据 challenge 时，保留真实拒绝原因。
+            if has_caller_supplied_credential(headers)
+                && !preflight
+                    .www_authenticate
+                    .iter()
+                    .any(|value| is_oauth_challenge(value))
+            {
+                return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
+                    McpAuthenticationError::CredentialsRejected,
+                ));
+            }
             let Some(mut auth_context) = auth_context else {
                 return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
-                    "Server requires authentication, which is not yet supported.".to_string(),
+                    McpAuthenticationError::OAuthUnavailable,
                 ));
             };
 
@@ -393,7 +484,10 @@ async fn determine_transport(
                 }
             };
 
-            match send_initialize_request(url, headers, Some(&client)).await? {
+            match send_initialize_request(url, headers, Some(&client))
+                .await?
+                .status
+            {
                 StatusCode::OK => {
                     emit_authenticated_notification().await;
                     Ok(Transport::Http(Some(client)))
@@ -409,13 +503,19 @@ async fn determine_transport(
     }
 }
 
-/// Sends an InitializeRequest to the server, and returns the HTTP status code from the response.
+/// 保留预检响应中的全部认证 challenge，以区分静态凭据拒绝和 OAuth。
+struct PreflightResponse {
+    status: reqwest::StatusCode,
+    www_authenticate: Vec<String>,
+}
+
+/// 发送 InitializeRequest，并返回选择传输方式所需的状态码与认证 challenge。
 #[allow(clippy::result_large_err)]
 async fn send_initialize_request(
     url: &str,
     headers: &HashMap<String, String>,
     auth_client: Option<&rmcp::transport::auth::AuthClient<reqwest::Client>>,
-) -> Result<reqwest::StatusCode, rmcp::RmcpError> {
+) -> Result<PreflightResponse, rmcp::RmcpError> {
     use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
 
     let request = rmcp::model::InitializeRequest::new(make_client_info());
@@ -445,7 +545,18 @@ async fn send_initialize_request(
         .await
         .map_err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>)?;
 
-    Ok(response.status())
+    let www_authenticate = response
+        .headers()
+        .get_all(http::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .collect();
+
+    Ok(PreflightResponse {
+        status: response.status(),
+        www_authenticate,
+    })
 }
 
 /// Creates a [`ClientInfo`] for the MCP client.

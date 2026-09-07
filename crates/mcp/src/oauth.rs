@@ -12,12 +12,43 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 use warp_core::channel::ChannelState;
-use warp_errors::report_error;
+use warp_errors::{ErrorExt, register_error, report_error};
 use warpui_extras::secure_storage::AppContextExt as _;
 mod loopback;
 
 pub const TEMPLATABLE_MCP_CREDENTIALS_KEY: &str = "TemplatableMcpCredentials";
 pub const FILE_BASED_MCP_CREDENTIALS_KEY: &str = "FileBasedMcpCredentials";
+
+/// MCP 认证失败的分类；界面层根据变体提供本地化提示。
+#[derive(Debug, thiserror::Error)]
+pub enum McpAuthenticationError {
+    #[error("MCP server rejected configured credentials (HTTP 401)")]
+    CredentialsRejected,
+    #[error("MCP header contains unresolved secret references; request was not sent")]
+    UnresolvedHeaderSecrets {
+        header: String,
+        secrets: Vec<String>,
+    },
+    #[error("MCP server requires authentication, but OAuth is disabled")]
+    OAuthUnavailable,
+    #[error("Interactive MCP OAuth is unavailable in headless mode")]
+    InteractiveOAuthRequired,
+    #[error(transparent)]
+    OAuth(#[from] AuthError),
+}
+
+impl ErrorExt for McpAuthenticationError {
+    fn is_actionable(&self) -> bool {
+        match self {
+            Self::CredentialsRejected
+            | Self::UnresolvedHeaderSecrets { .. }
+            | Self::OAuthUnavailable
+            | Self::InteractiveOAuthRequired => false,
+            Self::OAuth(_) => true,
+        }
+    }
+}
+register_error!(McpAuthenticationError);
 
 /// The issuer URL for GitHub's OAuth provider.
 const GITHUB_ISSUER: &str = "https://github.com/login/oauth";
@@ -262,7 +293,7 @@ pub async fn make_authenticated_client(
     resource_url: &str,
     http_client: reqwest::Client,
     auth_context: AuthContext,
-) -> Result<(AuthClient<reqwest::Client>, bool), AuthError> {
+) -> Result<(AuthClient<reqwest::Client>, bool), McpAuthenticationError> {
     let AuthContext {
         callback_mode,
         uuid,
@@ -317,15 +348,10 @@ pub async fn make_authenticated_client(
         if is_file_based {
             log::warn!(
                 "File-based MCP server {uuid} requires OAuth authentication; \
-                 skipping in headless mode. To use this server, authenticate it \
-                 in the Warp desktop app first."
+                 skipping interactive authentication in headless mode."
             );
         }
-        return Err(AuthError::AuthorizationFailed(
-            "MCP server requires OAuth authentication. Please authenticate this server in the \
-             Warp desktop app first, then try again."
-                .to_string(),
-        ));
+        return Err(McpAuthenticationError::InteractiveOAuthRequired);
     }
 
     let metadata = auth_manager.discover_metadata().await?;
@@ -412,7 +438,8 @@ pub async fn make_authenticated_client(
         CallbackResult::Error { error } => {
             return Err(AuthError::AuthorizationFailed(
                 error.as_deref().unwrap_or("unknown error").to_string(),
-            ));
+            )
+            .into());
         }
     };
 

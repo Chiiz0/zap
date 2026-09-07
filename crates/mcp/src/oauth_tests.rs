@@ -10,6 +10,44 @@ use tokio::net::TcpStream;
 
 use super::*;
 
+#[tokio::test]
+async fn headless_oauth_without_credentials_returns_typed_interactive_requirement() {
+    crate::install_test_crypto_provider();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("本地测试端口应可用");
+    let resource_url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let (callback_tx, callback_rx) = async_channel::unbounded();
+    let context = AuthContext {
+        callback_mode: OAuthCallbackMode::CustomScheme {
+            redirect_uri: "infinishell://mcp/oauth2callback".to_string(),
+            result_rx: callback_rx,
+        },
+        uuid: Uuid::new_v4(),
+        persisted_credentials: None,
+        is_headless: true,
+        is_file_based: true,
+        persist_credentials: Box::new(|_, _| Box::pin(async { Ok(()) })),
+        requires_authentication: Box::new(|_, _, _| {
+            Box::pin(async { panic!("无界面模式不得触发交互式认证") })
+        }),
+        authenticated: None,
+    };
+
+    let error = make_authenticated_client(&resource_url, reqwest::Client::new(), context)
+        .await
+        .err()
+        .expect("缺少凭据时应返回无界面认证限制");
+
+    assert!(matches!(
+        error,
+        McpAuthenticationError::InteractiveOAuthRequired
+    ));
+    assert!(!error.is_actionable());
+    assert!(!format!("{error}").contains("Warp"));
+    drop(callback_tx);
+}
+
 /// Builds a minimal `OAuthTokenResponse` for tests, optionally with a refresh token.
 fn make_test_token_response(refresh_token: Option<&str>) -> OAuthTokenResponse {
     let mut json = serde_json::json!({
@@ -160,6 +198,7 @@ async fn exchange_token() -> Json<serde_json::Value> {
 
 #[tokio::test]
 async fn loopback_oauth_completes_dcr_and_code_exchange() {
+    crate::install_test_crypto_provider();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("fake OAuth server should bind");

@@ -4,9 +4,9 @@ use std::sync::Arc;
 use async_compat::CompatExt as _;
 use mcp::oauth::{
     self, AuthContext, CallbackResult, FILE_BASED_MCP_CREDENTIALS_KEY,
-    FileBasedPersistedCredentialsMap, OAuthCallbackMode, PersistedCredentials,
-    PersistedCredentialsMap, TEMPLATABLE_MCP_CREDENTIALS_KEY, load_credentials_from_secure_storage,
-    write_to_secure_storage,
+    FileBasedPersistedCredentialsMap, McpAuthenticationError, OAuthCallbackMode,
+    PersistedCredentials, PersistedCredentialsMap, TEMPLATABLE_MCP_CREDENTIALS_KEY,
+    load_credentials_from_secure_storage, write_to_secure_storage,
 };
 use mcp::runtime::{error_to_user_message, spawn_server};
 use parking_lot::Mutex;
@@ -256,6 +256,7 @@ impl TemplatableMCPServerManager {
             }
             // Notification for cloud-environment readiness; handled by the AgentDriver.
             FileBasedMCPManagerEvent::CloudEnvMcpScanComplete { .. }
+            | FileBasedMCPManagerEvent::InitialGlobalMcpScanComplete { .. }
             | FileBasedMCPManagerEvent::ServersChanged
             | FileBasedMCPManagerEvent::ConfigDiagnosticChanged => {}
         });
@@ -1050,7 +1051,7 @@ impl TemplatableMCPServerManager {
                         log::warn!("Failed to spawn MCP server: {e:#}");
 
                         // Store user-friendly error message.
-                        let error_message = error_to_user_message(&e);
+                        let error_message = localized_mcp_error_message(&e);
                         me.server_error_messages
                             .insert(installation_uuid, error_message.clone());
 
@@ -1863,4 +1864,31 @@ impl TemplatableMCPServerManager {
         self.file_based_server_credentials
             .contains_key(&installation_hash)
     }
+}
+
+fn localized_mcp_error_message(error: &rmcp::RmcpError) -> String {
+    if let rmcp::RmcpError::TransportCreation { error: source, .. } = error
+        && let Some(auth_error) = source.downcast_ref::<McpAuthenticationError>()
+    {
+        match auth_error {
+            McpAuthenticationError::CredentialsRejected => {
+                return crate::t!("mcp-credentials-rejected");
+            }
+            McpAuthenticationError::UnresolvedHeaderSecrets { header, secrets } => {
+                return crate::t!(
+                    "mcp-header-unresolved-secrets",
+                    header = header,
+                    secrets = secrets.join(", ")
+                );
+            }
+            McpAuthenticationError::OAuthUnavailable => {
+                return crate::t!("mcp-oauth-unavailable");
+            }
+            McpAuthenticationError::InteractiveOAuthRequired => {
+                return crate::t!("mcp-headless-oauth-required");
+            }
+            McpAuthenticationError::OAuth(_) => {}
+        }
+    }
+    error_to_user_message(error)
 }
