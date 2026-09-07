@@ -210,8 +210,10 @@ impl Cell {
     /// a row from flat scrollback storage, where the stored content was
     /// already capped on the way in) should pass `false` to suppress
     /// that redundant warning.
+    ///
+    /// 返回是否成功追加字符；达到字素大小上限时返回 `false`，并保留原内容。
     #[inline]
-    pub fn push_zerowidth(&mut self, c: char, log_long_grapheme_warnings: bool) {
+    pub fn push_zerowidth(&mut self, c: char, log_long_grapheme_warnings: bool) -> bool {
         // If we're adding a zero-width character to this cell, but it has not
         // had any content set yet, set the content to a space.  This preserves
         // its visual appearance, but clearly marks the cell as having been
@@ -232,7 +234,7 @@ impl Cell {
                     // zero-width characters: logging every dropped
                     // character would produce a flood of spam for
                     // pathological streams.
-                    return;
+                    return false;
                 }
                 zerowidth.push(c);
                 // Log exactly once, on the push that first takes this cell
@@ -255,6 +257,30 @@ impl Cell {
                 extra.cell_with_zero_width = Some(format!("{}{}", self.c, c));
             }
         }
+        true
+    }
+
+    /// 移除并返回最近追加的零宽字符，保留超链接和提示符标记。
+    #[inline]
+    pub fn pop_zerowidth(&mut self) -> Option<char> {
+        let base_char_len = self.c.len_utf8();
+        let extra = self.extra.as_deref_mut()?;
+        let content = extra.cell_with_zero_width.as_mut()?;
+        if content.len() <= base_char_len {
+            return None;
+        }
+
+        let popped = content.pop();
+        if content.len() == base_char_len {
+            extra.cell_with_zero_width = None;
+        }
+        if extra.cell_with_zero_width.is_none()
+            && extra.end_of_prompt.is_none()
+            && extra.hyperlink_id.is_none()
+        {
+            self.extra = None;
+        }
+        popped
     }
 
     /// Returns whether cell is the end of prompt content (contains `EndOfPromptMarker`).

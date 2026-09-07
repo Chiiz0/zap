@@ -61,6 +61,9 @@ fn push_zerowidth_caps_accumulated_grapheme() {
     for _ in 0..pushes {
         cell.push_zerowidth(zwj, /* log_long_grapheme_warnings */ true);
     }
+    let capped_cell = cell.clone();
+    assert!(!cell.push_zerowidth(zwj, /* 记录超长字素警告 */ true));
+    assert_eq!(cell, capped_cell);
 
     let CharOrStr::Str(content) = cell.raw_content() else {
         panic!("cell should have accumulated zero-width content as a string");
@@ -97,6 +100,34 @@ fn push_zerowidth_seeds_base_char_on_first_push() {
     };
     assert_eq!(cell.raw_content(), CharOrStr::Char('x'));
 
-    cell.push_zerowidth('\u{0301}', /* log_long_grapheme_warnings */ true);
+    assert!(cell.push_zerowidth('\u{0301}', /* 记录超长字素警告 */ true));
     assert_eq!(cell.raw_content(), CharOrStr::Str("x\u{0301}"));
+}
+
+#[test]
+fn pop_zerowidth_restores_previous_cell_content() {
+    let mut cell = Cell::from('x');
+    let original_cell = cell.clone();
+
+    assert!(cell.push_zerowidth('\u{0301}', false));
+    let cell_with_first_zerowidth = cell.clone();
+    assert!(cell.push_zerowidth('\u{200D}', false));
+
+    assert_eq!(cell.pop_zerowidth(), Some('\u{200D}'));
+    assert_eq!(cell, cell_with_first_zerowidth);
+    assert_eq!(cell.pop_zerowidth(), Some('\u{0301}'));
+    assert_eq!(cell, original_cell);
+    assert_eq!(cell.pop_zerowidth(), None);
+}
+
+#[test]
+fn pop_zerowidth_preserves_prompt_marker() {
+    let mut cell = Cell::from('⚠');
+    cell.mark_end_of_prompt(true);
+    let original_cell = cell.clone();
+
+    assert!(cell.push_zerowidth('\u{FE0F}', false));
+
+    assert_eq!(cell.pop_zerowidth(), Some('\u{FE0F}'));
+    assert_eq!(cell, original_cell);
 }
