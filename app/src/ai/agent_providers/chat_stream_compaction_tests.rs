@@ -51,14 +51,47 @@ fn all_byop_protocols_preflight_without_provider_usage() {
         assert!(!byop_request_needs_compaction(
             &history_params(20),
             &provider,
-            "test-model"
+            "test-model",
+            &byop_compaction::CompactionConfig::default(),
         ));
         assert!(byop_request_needs_compaction(
             &history_params(90_000),
             &provider,
-            "test-model"
+            "test-model",
+            &byop_compaction::CompactionConfig::default(),
         ));
     }
+}
+
+#[test]
+fn responses_server_compaction_does_not_trigger_a_second_local_summary() {
+    let mut provider = provider(AgentProviderApiType::OpenAiResp, 200_000);
+    provider.responses.compact_threshold = 100_000;
+
+    assert!(!byop_request_needs_compaction(
+        &history_params(90_000),
+        &provider,
+        "test-model",
+        &byop_compaction::CompactionConfig::default(),
+    ));
+}
+
+#[test]
+fn uncompactable_estimated_overflow_does_not_block_the_original_request() {
+    let provider = provider(AgentProviderApiType::OpenAi, 32_768);
+    let mut params = history_params(20);
+    params.tasks[0].messages = vec![
+        make_user_query_message("task-1", "req-1", "hello ".repeat(20_000), &[]),
+        make_agent_output_message("task-1", "req-1", "done".to_owned()),
+    ];
+
+    assert!(!byop_request_needs_compaction(
+        &params,
+        &provider,
+        "test-model",
+        &byop_compaction::CompactionConfig::default(),
+    ));
+    assert!(build_byop_preflight_request(&params, &provider, "test-model").is_ok());
 }
 
 #[test]
@@ -69,13 +102,15 @@ fn compaction_uses_smaller_profile_window_and_reserves_summary_budget() {
     assert!(!byop_request_needs_compaction(
         &params,
         &provider,
-        "test-model"
+        "test-model",
+        &byop_compaction::CompactionConfig::default(),
     ));
     params.context_window_limit = Some(32_000);
     assert!(byop_request_needs_compaction(
         &params,
         &provider,
-        "test-model"
+        "test-model",
+        &byop_compaction::CompactionConfig::default(),
     ));
     params.input = vec![AIAgentInput::SummarizeConversation {
         prompt: None,
@@ -249,6 +284,132 @@ async fn provider_stream_delivers_usage_to_controller() {
     assert_eq!(finished.token_usage[0].total_input, 100);
     assert_eq!(finished.token_usage[0].output, 10);
     assert_eq!(finished.token_usage[0].input_cache_read, 80);
+}
+
+async fn anthropic_reasoning_request(
+    summarizing: bool,
+    model_id: &str,
+    effort: crate::settings::ReasoningEffortSetting,
+    max_output: u32,
+    expected_thinking_budget: Option<u64>,
+) {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/v1/messages")
+        .match_request(move |request| {
+            let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+            body["model"] == "claude-sonnet-4-5"
+                && body["max_tokens"] == max_output
+                && body["thinking"]["budget_tokens"].as_u64() == expected_thinking_budget
+        })
+        .with_header("content-type", "text/event-stream")
+        .with_body(concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"complete summary\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .create_async()
+        .await;
+    let mut params = history_params(20);
+    if summarizing {
+        let mut provider = provider(AgentProviderApiType::Anthropic, 200_000);
+        provider.models[0].id = model_id.to_owned();
+        provider.models[0].max_output_tokens = max_output;
+        params.input = vec![AIAgentInput::SummarizeConversation {
+            prompt: None,
+            overflow: false,
+            context: Arc::from([]),
+        }];
+        params.compaction_plan = prepare_byop_compaction(
+            &params,
+            &provider,
+            model_id,
+            &byop_compaction::CompactionConfig::default(),
+        );
+        assert!(params.compaction_plan.is_some());
+    }
+    let (_cancel, cancellation_rx) = futures::channel::oneshot::channel();
+    let stream = generate_byop_output(ByopOutputInput {
+        params,
+        base_url: format!("{}/v1", server.url()),
+        api_key: "test-key".to_owned(),
+        model_id: model_id.to_owned(),
+        api_type: AgentProviderApiType::Anthropic,
+        reasoning_effort: effort,
+        extra_headers: vec![],
+        responses: Default::default(),
+        task_id: "task-1".to_owned(),
+        target_task_id: "task-1".to_owned(),
+        needs_create_task: false,
+        lrc_command_id: None,
+        lrc_should_spawn_subagent: false,
+        context_window: Some(200_000),
+        cancellation_rx,
+        attachment_caps: Default::default(),
+    })
+    .await
+    .unwrap();
+    let events: Vec<_> = stream.collect().await;
+    mock.assert_async().await;
+    assert!(events.iter().all(Result::is_ok), "{events:?}");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Ok(api::ResponseEvent {
+            r#type: Some(api::response_event::Type::Finished(_)),
+            ..
+        })
+    )));
+}
+
+#[tokio::test]
+async fn anthropic_summary_keeps_thinking_below_its_output_cap() {
+    anthropic_reasoning_request(
+        true,
+        "claude-sonnet-4-5",
+        crate::settings::ReasoningEffortSetting::High,
+        8_000,
+        Some(4_000),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn anthropic_summary_handles_reasoning_inferred_from_model_suffix() {
+    anthropic_reasoning_request(
+        true,
+        "claude-sonnet-4-5-high",
+        crate::settings::ReasoningEffortSetting::Auto,
+        8_000,
+        Some(4_000),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn anthropic_small_summary_budget_leaves_room_for_text() {
+    anthropic_reasoning_request(
+        true,
+        "claude-sonnet-4-5",
+        crate::settings::ReasoningEffortSetting::Medium,
+        1_024,
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn anthropic_normal_high_reasoning_request_remains_unchanged() {
+    anthropic_reasoning_request(
+        false,
+        "claude-sonnet-4-5",
+        crate::settings::ReasoningEffortSetting::High,
+        64_000,
+        Some(24_000),
+    )
+    .await;
 }
 
 #[tokio::test]

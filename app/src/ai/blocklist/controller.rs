@@ -173,10 +173,16 @@ impl SessionContext {
 }
 
 pub enum BlocklistAIControllerEvent {
-    /// 仅在原草稿和附件均未变化时清空已经续发成功的输入。
-    SubmittedCompactedInput {
+    /// 由输入视图保存实际草稿，不能用已展开的 /plan 或 /init 协议文本代替。
+    CompactingInput {
+        stream_id: ResponseStreamId,
         query: String,
-        context_snapshot: PendingContextSnapshot,
+        user_query_mode: UserQueryMode,
+    },
+    /// 无论续发成功或失败都释放快照；成功时只清空未修改的草稿和附件。
+    SubmittedCompactedInput {
+        stream_id: ResponseStreamId,
+        submitted: bool,
     },
     /// Emitted when a request is sent to the AI agent API.
     SentRequest {
@@ -406,6 +412,8 @@ pub struct BlocklistAIController {
 /// 见 `pending_byop_requests`。
 struct PendingByopRequest {
     allow_auto_compaction: bool,
+    /// readiness 等待前的上下文；等待期间新增的附件不属于这次待发请求。
+    context_snapshot: Option<PendingContextSnapshot>,
     request_input: RequestInput,
     query_metadata: Option<RequestMetadata>,
     default_to_follow_up_on_success: bool,
@@ -415,8 +423,7 @@ struct PendingByopRequest {
 
 struct PendingByopCompactionRequest {
     request: PendingByopRequest,
-    original_query: Option<String>,
-    context_snapshot: PendingContextSnapshot,
+    clear_input_on_success: bool,
 }
 
 fn can_continue_after_byop_compaction(
@@ -1585,12 +1592,18 @@ impl BlocklistAIController {
         };
         let PendingByopRequest {
             allow_auto_compaction,
+            context_snapshot,
             mut request_input,
             query_metadata,
             default_to_follow_up_on_success,
             can_attempt_resume_on_error,
             is_queued_prompt,
         } = pending;
+        // 旧请求恢复时沿用排队提交语义，不能消费后来加入的草稿上下文。
+        let is_queued_prompt = is_queued_prompt
+            || context_snapshot.is_some_and(|snapshot| {
+                snapshot != self.context_model.as_ref(ctx).pending_context_snapshot()
+            });
 
         let finished_results = self.action_model.update(ctx, |action_model, _| {
             action_model.drain_finished_action_results(conversation_id)
@@ -3012,6 +3025,7 @@ impl BlocklistAIController {
     fn retain_input_after_failed_compaction(
         &mut self,
         pending: PendingByopRequest,
+        compaction_exchange_id: Option<AIAgentExchangeId>,
         cancellation: Option<CancellationReason>,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -3027,6 +3041,71 @@ impl BlocklistAIController {
         } else {
             cancellation
         };
+        // 摘要占据原问题提交时的位置。原地补回输入，避免把已取消的旧问题追加到
+        // 后来开始的新回答之后，导致视图把新回答误判为已结束并提前处理队列。
+        if let Some(exchange_id) = compaction_exchange_id {
+            let restored = BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                let Some(conversation) = history.conversation_mut(&conversation_id) else {
+                    return false;
+                };
+                let Ok(exchange) = conversation.get_exchange_to_update(exchange_id) else {
+                    return false;
+                };
+                if !exchange
+                    .input
+                    .iter()
+                    .any(|input| matches!(input, AIAgentInput::SummarizeConversation { .. }))
+                {
+                    return false;
+                }
+                let previous_error = if let AIAgentOutputStatus::Finished {
+                    finished_output: FinishedAIAgentOutput::Error { error, .. },
+                } = &exchange.output_status
+                {
+                    Some(error.clone())
+                } else {
+                    None
+                };
+                exchange.input = pending.request_input.all_inputs().cloned().collect();
+                exchange.start_time = pending.request_input.request_start_ts;
+                exchange.output_status = AIAgentOutputStatus::Finished {
+                    finished_output: if let Some(reason) = cancellation {
+                        FinishedAIAgentOutput::Cancelled {
+                            output: None,
+                            reason,
+                        }
+                    } else {
+                        FinishedAIAgentOutput::Error {
+                            output: None,
+                            error: previous_error.unwrap_or_else(|| {
+                                RenderableAIError::ContextWindowExceeded(crate::t!(
+                                    "ai-error-context-too-large"
+                                ))
+                            }),
+                        }
+                    },
+                };
+                conversation.write_updated_conversation_state(ctx);
+                ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
+                    exchange_id,
+                    terminal_surface_id: self.terminal_view_id,
+                    conversation_id,
+                    is_hidden: conversation.is_exchange_hidden(exchange_id),
+                });
+                if cancellation.is_none() {
+                    history.update_conversation_status(
+                        self.terminal_view_id,
+                        conversation_id,
+                        ConversationStatus::Error,
+                        ctx,
+                    );
+                }
+                true
+            });
+            if restored {
+                return;
+            }
+        }
         let stream_id = ResponseStreamId::new_local();
         // 只补回原始输入的可见记录，不清空用户后来编辑的草稿或附件。
         BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
@@ -3184,6 +3263,9 @@ impl BlocklistAIController {
                     conversation_id,
                     PendingByopRequest {
                         allow_auto_compaction,
+                        context_snapshot: Some(
+                            self.context_model.as_ref(ctx).pending_context_snapshot(),
+                        ),
                         request_input,
                         query_metadata,
                         default_to_follow_up_on_success,
@@ -3281,6 +3363,7 @@ impl BlocklistAIController {
                     &request_params,
                     &provider,
                     &model_id,
+                    &compaction_cfg,
                 )
             {
                 // readiness 已持久化完成的工具结果；保留剩余原输入，摘要本身不重执行工具。
@@ -3303,24 +3386,34 @@ impl BlocklistAIController {
                         let original_query = (!is_queued_prompt)
                             .then(|| {
                                 request_input.all_inputs().find_map(|input| {
-                                    if let AIAgentInput::UserQuery { query, .. } = input {
-                                        Some(query.clone())
+                                    if let AIAgentInput::UserQuery {
+                                        query,
+                                        user_query_mode,
+                                        ..
+                                    } = input
+                                    {
+                                        Some((query.clone(), *user_query_mode))
                                     } else {
                                         None
                                     }
                                 })
                             })
                             .flatten();
+                        let clear_input_on_success = original_query.is_some();
+                        if let Some((query, user_query_mode)) = original_query {
+                            ctx.emit(BlocklistAIControllerEvent::CompactingInput {
+                                stream_id: stream_id.clone(),
+                                query,
+                                user_query_mode,
+                            });
+                        }
                         self.pending_byop_compaction_requests.insert(
                             stream_id.clone(),
                             PendingByopCompactionRequest {
-                                original_query,
-                                context_snapshot: self
-                                    .context_model
-                                    .as_ref(ctx)
-                                    .pending_context_snapshot(),
+                                clear_input_on_success,
                                 request: PendingByopRequest {
                                     allow_auto_compaction,
+                                    context_snapshot: None,
                                     request_input,
                                     query_metadata,
                                     default_to_follow_up_on_success,
@@ -3427,7 +3520,7 @@ impl BlocklistAIController {
             ctx,
         );
 
-        if input_contains_user_query && allow_auto_compaction {
+        if input_contains_user_query && allow_auto_compaction && !is_queued_prompt {
             // Get the pending document ID before clearing context
             let pending_document_id = self.context_model.as_ref(ctx).pending_document_id();
 
@@ -3940,6 +4033,11 @@ impl BlocklistAIController {
                     log::warn!("Conversation not found.");
                     return;
                 };
+                let compaction_exchange_id = pending_compaction.as_ref().and_then(|_| {
+                    conversation
+                        .new_exchange_ids_for_response(&stream_id)
+                        .next()
+                });
                 let new_exchange_ids = conversation.new_exchange_ids_for_response(&stream_id);
                 let mut was_passive_request = false;
                 let mut is_any_exchange_unfinished = false;
@@ -4141,8 +4239,7 @@ impl BlocklistAIController {
                 // 旧流及其会话映射已清理，后续请求不会取消刚完成的流或重复派发工具。
                 if let Some(PendingByopCompactionRequest {
                     request: pending,
-                    original_query,
-                    context_snapshot,
+                    clear_input_on_success,
                 }) = pending_compaction
                 {
                     let has_pending_work = has_new_actions
@@ -4154,6 +4251,7 @@ impl BlocklistAIController {
                         || self
                             .in_flight_response_streams
                             .has_active_stream_for_conversation(conversation_id, ctx);
+                    let mut submitted = false;
                     if can_continue_after_byop_compaction(
                         compaction_committed,
                         cancellation.is_some(),
@@ -4175,21 +4273,29 @@ impl BlocklistAIController {
                                     request_input: backup_input,
                                     ..pending
                                 },
+                                compaction_exchange_id,
                                 None,
                                 ctx,
                             );
-                        } else if let Some(query) = original_query {
-                            ctx.emit(BlocklistAIControllerEvent::SubmittedCompactedInput {
-                                query,
-                                context_snapshot,
-                            });
+                        } else if let Ok((_, resumed_stream_id)) = result {
+                            submitted = self
+                                .in_flight_response_streams
+                                .stream_ids_for_conversation(conversation_id, ctx)
+                                .contains(&resumed_stream_id);
                         }
                     } else {
                         self.retain_input_after_failed_compaction(
                             pending,
+                            compaction_exchange_id,
                             cancellation.as_ref().map(|cancelled| cancelled.reason),
                             ctx,
                         );
+                    }
+                    if clear_input_on_success {
+                        ctx.emit(BlocklistAIControllerEvent::SubmittedCompactedInput {
+                            stream_id: stream_id.clone(),
+                            submitted,
+                        });
                     }
                 } else if compact_after_stream
                     && cancellation.is_none()

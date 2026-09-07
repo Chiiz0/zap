@@ -75,6 +75,7 @@ pub use child_agent_launch::{
 };
 #[cfg(feature = "tui")]
 pub use context_model::PendingAttachmentSummary;
+pub(crate) use context_model::PendingContextSnapshot;
 #[cfg(not(feature = "tui"))]
 pub(crate) use context_model::block_context_from_terminal_model;
 #[cfg(feature = "tui")]

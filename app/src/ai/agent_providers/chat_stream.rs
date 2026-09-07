@@ -1524,12 +1524,16 @@ pub(crate) fn byop_request_needs_compaction(
     params: &RequestParams,
     provider: &AgentProvider,
     model_id: &str,
+    cfg: &byop_compaction::CompactionConfig,
 ) -> bool {
-    // 没有历史可压缩时，直接由硬预算检查报告当前输入过大。
-    if params.tasks.iter().all(|task| task.messages.is_empty()) {
+    // 显式启用的 Responses 服务端压缩继续负责其状态窗口；不能按本地旧原文抢先摘要。
+    if (provider.api_type == AgentProviderApiType::OpenAiResp
+        && provider.responses.compact_threshold > 0)
+        || params.tasks.iter().all(|task| task.messages.is_empty())
+    {
         return false;
     }
-    match build_byop_preflight_request(params, provider, model_id) {
+    let pressure = match build_byop_preflight_request(params, provider, model_id) {
         Ok((request, _)) => {
             request_budget::estimated_input_tokens(&request)
                 >= request_budget::input_token_budget(byop_context_window(
@@ -1541,7 +1545,20 @@ pub(crate) fn byop_request_needs_compaction(
             error.is::<request_budget::RequestBudgetExceeded>()
         }
         Err(ConvertToAPITypeError::Ignore | ConvertToAPITypeError::Unimplemented(_)) => false,
+    };
+    if !pressure {
+        return false;
     }
+    // 估算超过阈值只建议摘要。没有可安全发送的摘要范围时，让原请求继续由提供商判断，
+    // 不能用一次注定无法开始的内部摘要挡住原本可能有效的用户请求。
+    let mut summary_params = params.clone();
+    summary_params.input = vec![AIAgentInput::SummarizeConversation {
+        prompt: None,
+        overflow: true,
+        context: Arc::from([]),
+    }];
+    summary_params.compaction_plan = None;
+    prepare_byop_compaction(&summary_params, provider, model_id, cfg).is_some()
 }
 
 pub(crate) fn prepare_byop_compaction(
@@ -1569,7 +1586,9 @@ pub(crate) fn prepare_byop_compaction(
     byop_compaction::plan::prepare_plan(&all_msgs, &state, cfg, model, |plan| {
         let mut params = params.clone();
         params.compaction_plan = Some(plan.clone());
-        build_byop_preflight_request(&params, provider, model_id).is_ok()
+        build_byop_preflight_request(&params, provider, model_id).is_ok_and(|(request, _)| {
+            request_budget::estimated_input_tokens(&request) <= model.input
+        })
     })
 }
 
@@ -3842,7 +3861,7 @@ pub async fn generate_byop_output(
         }
     }
 
-    // 配置文件的模型窗口与 profile 上限取较小值，未知模型也保留默认硬预算。
+    // 配置文件的模型窗口与 profile 上限取较小值；未知模型使用默认估算和工具字节上限。
     params.context_window_limit = params
         .context_window_limit
         .filter(|limit| *limit > 0)
@@ -3862,6 +3881,7 @@ pub async fn generate_byop_output(
             truncated_results,
             original_result_bytes,
             sent_result_bytes,
+            ..
         } = budget_report;
         log::warn!(
             "[byop-budget] 已限制工具结果: truncated_results={truncated_results} \
@@ -3876,23 +3896,27 @@ pub async fn generate_byop_output(
                 .filter_map(|tool| serde_json::to_value(tool).ok())
                 .collect::<Vec<_>>()
         });
-        let fingerprint = super::responses::response_request_context_fingerprint(
+        let mut fingerprint = super::responses::response_request_context_fingerprint(
             &base_url,
             Some(&model_id),
             chat_req.system.as_deref(),
             tools.as_deref(),
         );
         // 摘要或 prune 改变有效历史后，旧 Responses 链即使 system/tools 相同也不能续接。
-        match local_compaction_fingerprint(&params) {
-            Some(local) => format!("{fingerprint}:{local}"),
-            None => fingerprint,
+        if let Some(local) = local_compaction_fingerprint(&params) {
+            fingerprint.push(':');
+            fingerprint.push_str(&local);
         }
+        if let Some(bounded) = &budget_report.truncated_fingerprint {
+            fingerprint.push_str(":bounded:");
+            fingerprint.push_str(bounded);
+        }
+        fingerprint
     });
     let previous_provider_state = latest_provider_response_state(&params);
     let compatible_provider_state = previous_provider_state.as_ref().filter(|state| {
-        // 本地历史有裁剪时不能复用包含原始大输出的远端状态；用有预算的完整回放恢复。
+        // 首次裁剪或裁剪内容变化会改变指纹；相同投影可复用已接收该版本的远端状态。
         !is_summarization_request
-            && budget_report.truncated_results == 0
             && state.request_context_fingerprint.as_ref() == response_context_fingerprint.as_ref()
             && state.state_mode == Some(responses.state_mode)
     });
@@ -4130,9 +4154,11 @@ pub async fn generate_byop_output(
         };
     // 有提供商精确计数时，再检查包含远端状态和多模态附件的真实请求。
     // 不支持计数接口的兼容服务仍受前面的本地工具结果预算保护。
-    if preflight_input_tokens > 0
-        && preflight_input_tokens as usize
-            > request_budget::input_token_budget(params.context_window_limit)
+    if responses.compact_threshold == 0
+        && preflight_input_tokens > 0
+        && params.context_window_limit.is_some_and(|window| {
+            preflight_input_tokens as u32 > window.saturating_sub(chat_opts.max_tokens.unwrap_or(0))
+        })
     {
         return Err(ConvertToAPITypeError::Other(
             request_budget::RequestBudgetExceeded.into(),

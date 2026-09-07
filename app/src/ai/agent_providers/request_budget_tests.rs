@@ -216,6 +216,28 @@ fn oversized_plain_text_is_explicitly_wrapped_as_a_partial_preview() {
 }
 
 #[test]
+fn repeated_bounded_history_keeps_its_fingerprint_but_changed_output_invalidates_it() {
+    let history = ChatRequest::new(vec![shell_result("call-1", &"x".repeat(200_000))]);
+    let mut first = history.clone();
+    let first_report = apply(&mut first, Some(200_000)).unwrap();
+    let mut repeated = history;
+    repeated.messages.push(ChatMessage::user("继续"));
+    let repeated_report = apply(&mut repeated, Some(200_000)).unwrap();
+    let mut changed = ChatRequest::new(vec![shell_result("call-1", &"y".repeat(200_000))]);
+    let changed_report = apply(&mut changed, Some(200_000)).unwrap();
+
+    assert!(first_report.truncated_fingerprint.is_some());
+    assert_eq!(
+        first_report.truncated_fingerprint,
+        repeated_report.truncated_fingerprint
+    );
+    assert_ne!(
+        first_report.truncated_fingerprint,
+        changed_report.truncated_fingerprint
+    );
+}
+
+#[test]
 fn short_results_remain_byte_for_byte_unchanged() {
     let mut request = ChatRequest::new(vec![
         ChatMessage::user("检查服务状态"),
@@ -270,6 +292,43 @@ fn small_model_window_accepts_short_conversations() {
 }
 
 #[test]
+fn small_window_image_is_not_rejected_by_a_fixed_token_estimate() {
+    let mut request = ChatRequest::new(vec![ChatMessage::user(MessageContent::from_parts(vec![
+        ContentPart::Text("识别这张小图".to_owned()),
+        ContentPart::Binary(Binary::from_base64("image/png", "AAAA", None)),
+    ]))]);
+    let original = serde_json::to_value(&request).unwrap();
+
+    apply(&mut request, Some(8_192)).expect("图片估算不是实际 token，不能据此拒绝请求");
+
+    assert_eq!(serde_json::to_value(&request).unwrap(), original);
+}
+
+#[test]
+fn estimated_overflow_keeps_non_tool_text_and_still_bounds_logs() {
+    let mut request = ChatRequest::new(vec![
+        ChatMessage::user("hello ".repeat(10_000)),
+        shell_result("call-1", &"日志".repeat(100_000)),
+    ]);
+    let original_user = serde_json::to_value(&request.messages[0]).unwrap();
+
+    let report =
+        apply(&mut request, Some(32_768)).expect("保守估算只能建议压缩，不能假装提供商已拒绝正文");
+
+    assert_eq!(
+        serde_json::to_value(&request.messages[0]).unwrap(),
+        original_user
+    );
+    assert_eq!(report.truncated_results, 1);
+    assert!(
+        serde_json::to_vec(&tool_responses(&request)[0].content)
+            .unwrap()
+            .len()
+            <= MAX_RESULT_BYTES
+    );
+}
+
+#[test]
 fn small_model_window_reduces_tool_output_below_the_default_cap() {
     let mut request = ChatRequest::new(vec![shell_result("call-1", &"x".repeat(200_000))]);
 
@@ -283,13 +342,13 @@ fn small_model_window_reduces_tool_output_below_the_default_cap() {
 }
 
 #[test]
-fn oversized_non_tool_context_returns_an_error_without_deleting_messages() {
+fn oversized_non_tool_estimate_preserves_text_for_provider_validation() {
     let mut request = ChatRequest::from_user("x".repeat(1_000_000));
     let original = serde_json::to_value(&request).unwrap();
 
-    let error = apply(&mut request, Some(200_000)).expect_err("无法安全裁剪的内容应明确拒绝");
+    let report = apply(&mut request, Some(200_000)).expect("不以估算冒充提供商的超限判定");
 
-    assert!(error.to_string().contains("context_window_exceeded"));
+    assert_eq!(report.truncated_results, 0);
     assert_eq!(serde_json::to_value(&request).unwrap(), original);
 }
 

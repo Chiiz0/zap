@@ -98,7 +98,13 @@ pub fn prepare_plan(
         .and_then(|tail| messages.iter().position(|message| message.id == tail.id))
         .unwrap_or(messages.len());
 
-    for end in (1..=head_end).rev() {
+    // 优先按原来的尾部策略向前找完整轮次；切点落在第一轮内部时，允许向后扩到
+    // 最近的完整轮次，避免有足够摘要预算却因没有更早用户边界而拒绝压缩。
+    // 扩展候选仍须通过工具闭合和实际请求预算检查，不直接丢弃保留区。
+    let candidate_ends = (1..=head_end)
+        .rev()
+        .chain(head_end.saturating_add(1)..=messages.len());
+    for end in candidate_ends {
         let at_user_boundary = messages.get(end).is_none_or(|message| {
             matches!(message.message, Some(api::message::Message::UserQuery(_)))
                 && !hidden.contains(&message.id)

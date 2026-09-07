@@ -390,6 +390,25 @@ impl Adapter for AnthropicAdapter {
 		let max_tokens = Self::resolve_max_tokens(model_name, &options_set);
 		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
 
+		// 无工具的摘要等短输出请求也可能继承 High/模型后缀推断，预算冲突时给正文
+		// 留出空间。带工具请求可能启用交错思考，允许预算超过 max_tokens，保持原值。
+		let has_tools = payload["tools"].as_array().is_some_and(|tools| !tools.is_empty());
+		if !has_tools
+			&& payload["thinking"]["type"] == "enabled"
+			&& payload["thinking"]["budget_tokens"]
+				.as_u64()
+				.is_some_and(|budget| budget >= u64::from(max_tokens))
+		{
+			if max_tokens >= REASONING_LOW * 2 {
+				payload["thinking"]["budget_tokens"] = json!(max_tokens / 2);
+			} else {
+				payload
+					.as_object_mut()
+					.expect("Anthropic 请求必须是 JSON 对象")
+					.remove("thinking");
+			}
+		}
+
 		if let Some(top_p) = options_set.top_p() {
 			payload.x_insert("top_p", top_p)?;
 		}
@@ -996,6 +1015,10 @@ pub(in crate::adapter) struct AnthropicRequestParts {
 // endregion: --- Support
 
 // region:    --- Tests
+
+#[cfg(test)]
+#[path = "adapter_impl_tests.rs"]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {

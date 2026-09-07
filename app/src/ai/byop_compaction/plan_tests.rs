@@ -316,6 +316,108 @@ fn no_fitting_complete_turn_produces_no_plan() {
 }
 
 #[test]
+fn oversized_single_turn_compacts_as_a_whole_when_request_fits() {
+    let messages = [
+        api::Message {
+            message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                query: "x".repeat(40_000),
+                ..Default::default()
+            })),
+            ..user("u1")
+        },
+        output("a1", "r1", "短回答"),
+    ];
+
+    let plan = prepare_plan(
+        &messages.iter().collect::<Vec<_>>(),
+        &CompactionState::default(),
+        &CompactionConfig::default(),
+        ModelLimit::FALLBACK,
+        |_| true,
+    )
+    .unwrap();
+
+    assert_eq!(plan.head_message_ids, ["u1", "a1"]);
+    assert_eq!(plan.tail_start_id, None);
+}
+
+#[test]
+fn expanding_a_split_turn_keeps_tool_pairs_and_preserves_later_turns() {
+    let messages = [
+        api::Message {
+            message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                query: "x".repeat(40_000),
+                ..Default::default()
+            })),
+            ..user("u1")
+        },
+        api::Message {
+            id: "call".to_owned(),
+            task_id: "root".to_owned(),
+            message: Some(api::message::Message::ToolCall(api::message::ToolCall {
+                tool_call_id: "tool-1".to_owned(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        user("u2"),
+        api::Message {
+            id: "result".to_owned(),
+            task_id: "root".to_owned(),
+            message: Some(api::message::Message::ToolCallResult(
+                api::message::ToolCallResult {
+                    tool_call_id: "tool-1".to_owned(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        },
+        user("u3"),
+        output("a3", "r3", "保留最近回答"),
+    ];
+
+    let plan = prepare_plan(
+        &messages.iter().collect::<Vec<_>>(),
+        &CompactionState::default(),
+        &CompactionConfig {
+            tail_turns: 3,
+            preserve_recent_tokens: Some(100),
+            ..Default::default()
+        },
+        ModelLimit::FALLBACK,
+        |_| true,
+    )
+    .unwrap();
+
+    assert_eq!(plan.head_message_ids, ["u1", "call", "u2", "result"]);
+    assert_eq!(plan.tail_start_id.as_deref(), Some("u3"));
+}
+
+#[test]
+fn expanding_a_split_turn_still_requires_request_to_fit() {
+    let messages = [
+        api::Message {
+            message: Some(api::message::Message::UserQuery(api::message::UserQuery {
+                query: "x".repeat(40_000),
+                ..Default::default()
+            })),
+            ..user("u1")
+        },
+        output("a1", "r1", "短回答"),
+    ];
+
+    let plan = prepare_plan(
+        &messages.iter().collect::<Vec<_>>(),
+        &CompactionState::default(),
+        &CompactionConfig::default(),
+        ModelLimit::FALLBACK,
+        |_| false,
+    );
+
+    assert!(plan.is_none());
+}
+
+#[test]
 fn shrinking_never_separates_a_tool_call_from_its_result() {
     let messages = [
         user("u1"),

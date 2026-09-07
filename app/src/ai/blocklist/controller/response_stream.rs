@@ -297,14 +297,20 @@ impl ResponseStream {
         // 则在 spawn 前从 ctx 中取出 (provider, api_key, model_id, root_task_id),
         // 走自定义 chat completions。否则走 warp 自家 multi-agent 端点(原有路径)。
         let byop_dispatch = byop_dispatch_info(&params, &ai_identifiers, ctx);
-        let byop_context_window = byop_dispatch.as_ref().map(|byop| {
-            params
-                .context_window_limit
-                .filter(|limit| *limit > 0)
-                .into_iter()
-                .chain(byop.context_window)
-                .min()
-        });
+        let byop_context_window = byop_dispatch
+            .as_ref()
+            .filter(|byop| {
+                byop.api_type != crate::settings::AgentProviderApiType::OpenAiResp
+                    || byop.responses.compact_threshold == 0
+            })
+            .map(|byop| {
+                params
+                    .context_window_limit
+                    .filter(|limit| *limit > 0)
+                    .into_iter()
+                    .chain(byop.context_window)
+                    .min()
+            });
         let pending_title_generation = byop_dispatch
             .as_ref()
             .and_then(|byop| pending_title_generation_from_byop(&params, byop));

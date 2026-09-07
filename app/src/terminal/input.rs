@@ -147,7 +147,7 @@ use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{
     AIAgentAttachment, AIAgentContext, AIAgentExchangeId, CancellationReason, EntrypointType,
-    ImageContext,
+    ImageContext, UserQueryMode,
 };
 use crate::ai::agent_conversations_model::{
     AgentConversationNavigationSubject, AgentConversationsModel,
@@ -172,10 +172,10 @@ use crate::ai::blocklist::{
     BlocklistAIControllerEvent, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
     BlocklistAIInputEvent, BlocklistAIInputModel, DIFF_HUNK_ATTACHMENT_REGEX,
     DRIVE_OBJECT_ATTACHMENT_REGEX, InputConfig, InputType, InputTypeAutoDetectionSource,
-    PendingAttachment, PendingFile, QueuedQuery, QueuedQueryEvent, QueuedQueryId, QueuedQueryModel,
-    QueuedQueryOrigin, SlashCommandRequest, ai_brand_color, ai_indicator_height,
-    drive_object_attachment_for_reference, plan_attachment_for_reference,
-    render_ai_agent_mode_icon, render_ai_follow_up_icon,
+    PendingAttachment, PendingContextSnapshot, PendingFile, QueuedQuery, QueuedQueryEvent,
+    QueuedQueryId, QueuedQueryModel, QueuedQueryOrigin, ResponseStreamId, SlashCommandRequest,
+    ai_brand_color, ai_indicator_height, drive_object_attachment_for_reference,
+    plan_attachment_for_reference, render_ai_agent_mode_icon, render_ai_follow_up_icon,
 };
 // InfiniShell:`ai::cloud_agent_settings` / `ai::cloud_environments` 已删除。
 use crate::ai::connected_self_hosted_workers::{
@@ -1572,6 +1572,8 @@ pub struct Input {
     last_word_insertion: LastWordInsertion,
 
     ai_controller: ModelHandle<BlocklistAIController>,
+    /// 仅保留当前草稿对应的摘要快照；新提交会覆盖或释放它。
+    pending_compacted_input: Option<(ResponseStreamId, String, PendingContextSnapshot)>,
     ai_context_model: ModelHandle<BlocklistAIContextModel>,
     ai_input_model: ModelHandle<BlocklistAIInputModel>,
     ai_action_model: ModelHandle<BlocklistAIActionModel>,
@@ -3074,19 +3076,44 @@ impl Input {
         );
 
         ctx.subscribe_to_model(&ai_controller, |me, _, event, ctx| match event {
+            BlocklistAIControllerEvent::CompactingInput { stream_id, query, user_query_mode } => {
+                let draft = me.buffer_text(ctx);
+                // readiness 等待期间用户可能已经改写草稿；只快照仍对应这次请求的输入。
+                let matches_request = draft == *query
+                    || (*user_query_mode == UserQueryMode::Plan
+                        && commands::strip_command_prefix(&draft, commands::PLAN_NAME).as_deref() == Some(query.as_str()))
+                    || match SlashCommandRequest::from_query(&draft) {
+                        Some(SlashCommandRequest::InitProjectRules { arguments }) => {
+                            crate::ai::agent_providers::prompt_renderer::render_init_project_command(arguments.as_deref()) == *query
+                        }
+                        _ => false,
+                    };
+                me.pending_compacted_input = matches_request.then(|| (
+                    stream_id.clone(), draft,
+                    me.ai_context_model.as_ref(ctx).pending_context_snapshot(),
+                ));
+            }
             BlocklistAIControllerEvent::SubmittedCompactedInput {
-                query,
-                context_snapshot,
+                stream_id,
+                submitted,
             } => {
-                if me.buffer_text(ctx) == *query
-                    && me.ai_context_model.as_ref(ctx).pending_context_snapshot()
-                        == *context_snapshot
+                if me
+                    .pending_compacted_input
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| pending == stream_id)
                 {
-                    me.editor
-                        .update(ctx, |editor, ctx| editor.system_clear_buffer(true, ctx));
-                    me.ai_context_model
-                        .update(ctx, |context, ctx| context.reset_context_to_default(ctx));
-                    ctx.notify();
+                    let (_, query, context_snapshot) = me.pending_compacted_input.take().unwrap();
+                    if *submitted
+                        && me.buffer_text(ctx) == query
+                        && me.ai_context_model.as_ref(ctx).pending_context_snapshot()
+                            == context_snapshot
+                    {
+                        me.editor
+                            .update(ctx, |editor, ctx| editor.system_clear_buffer(true, ctx));
+                        me.ai_context_model
+                            .update(ctx, |context, ctx| context.reset_context_to_default(ctx));
+                        ctx.notify();
+                    }
                 }
             }
             BlocklistAIControllerEvent::SentRequest {
@@ -3097,6 +3124,7 @@ impl Input {
                 // Skip the buffer clear for queued prompts. The user may have typed new
                 // input while the agent was busy and we don't want to wipe it on auto-send.
                 if *is_user_initiated && !*is_queued_prompt {
+                    me.pending_compacted_input = None;
                     me.editor.update(ctx, |editor, ctx| {
                         editor.system_clear_buffer(true, ctx);
                     });
@@ -3661,6 +3689,7 @@ impl Input {
             prompt_render_helper,
             prompt_type: current_prompt,
             ai_controller,
+            pending_compacted_input: None,
             ai_context_model,
             ai_input_model,
             ai_action_model,

@@ -1,11 +1,12 @@
 //! 只裁剪发给提供商的工具结果副本；终端、持久化历史和工具调用配对保持完整。
 //!
 //! 字节预算不是模型 tokenizer。按每 token 两个序列化 UTF-8 字节估算文本，
-//! 再留出输出和协议余量；未知模型也必须有工具结果的硬上限。
+//! 再留出输出和协议余量；该估算只建议压缩，工具结果另有独立的字节硬上限。
 
 use genai::chat::{ChatRequest, ContentPart};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const MAX_RESULT_BYTES: usize = 32 * 1024;
 const MAX_TOTAL_RESULT_BYTES: usize = 128 * 1024;
@@ -21,12 +22,14 @@ const TRUNCATION_NOTE: &str = "Partial tool output: the middle was omitted to fi
 )]
 pub(super) struct RequestBudgetExceeded;
 
-/// 有裁剪时，Responses 必须完整回放裁剪后的本地历史，不能续接仍含原文的服务端状态。
+/// 裁剪投影变化时，Responses 必须完整回放；投影相同则可复用已接收该版本的状态。
 #[derive(Debug, Default)]
 pub(super) struct BudgetReport {
     pub truncated_results: usize,
     pub original_result_bytes: usize,
     pub sent_result_bytes: usize,
+    /// 已裁剪的出站投影不变时，可以继续复用接收过该版本的 Responses 状态。
+    pub truncated_fingerprint: Option<String>,
 }
 
 pub(crate) fn input_token_budget(context_window: Option<u32>) -> usize {
@@ -37,7 +40,7 @@ pub(crate) fn input_token_budget(context_window: Option<u32>) -> usize {
     context.saturating_sub((context / 4).max(8_000).min(context / 2))
 }
 
-/// 与出站硬预算使用同一口径；仅用于压缩决策，不冒充提供商的计费用量。
+/// 与工具预算分配使用同一估算口径；仅用于压缩决策，不冒充提供商的计费用量。
 pub(super) fn estimated_input_tokens(request: &ChatRequest) -> usize {
     let mut bytes = serialized_size(request);
     for message in &request.messages {
@@ -182,11 +185,15 @@ pub(super) fn apply(
     }
     let mut remaining = request_budget
         .saturating_sub(fixed_bytes)
+        .max(minimum_results)
         .min(MAX_TOTAL_RESULT_BYTES);
-    if fixed_bytes > request_budget || minimum_results > remaining {
+    // 不因正文或附件的保守估算而硬拒绝；真实 token 数交给提供商判断。
+    // 仍须为每个工具结果保留控制信息，且不能突破累计字节硬上限。
+    if minimum_results > remaining {
         return Err(RequestBudgetExceeded);
     }
     let mut report = BudgetReport::default();
+    let mut truncated_fingerprint = Sha256::new();
     // 优先保留最近的结果，同时为每个旧结果留下明确提示，绝不删除 tool_call_id 配对。
     for message in request.messages.iter_mut().rev() {
         for part in message.content.iter_mut().rev() {
@@ -200,6 +207,10 @@ pub(super) fn apply(
                 if size > budget {
                     response.content = bounded_result(&response.content, budget);
                     report.truncated_results += 1;
+                    truncated_fingerprint.update((response.call_id.len() as u64).to_le_bytes());
+                    truncated_fingerprint.update(response.call_id.as_bytes());
+                    truncated_fingerprint.update((response.content.len() as u64).to_le_bytes());
+                    truncated_fingerprint.update(response.content.as_bytes());
                 }
                 let sent_size = serialized_size(&response.content);
                 if sent_size > budget {
@@ -209,6 +220,9 @@ pub(super) fn apply(
                 report.sent_result_bytes += response.content.len();
             }
         }
+    }
+    if report.truncated_results > 0 {
+        report.truncated_fingerprint = Some(hex::encode(truncated_fingerprint.finalize()));
     }
     Ok(report)
 }
