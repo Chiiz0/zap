@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use ai::agent::action_result::{AnyFileContent, FileContext};
 use ai::skills::SkillReference;
 #[cfg(feature = "local_fs")]
@@ -61,31 +59,8 @@ impl ReadSkillExecutor {
             return success_execution(skill);
         }
 
-        // BYOP `read_skill` 工具的实参是 skill **name**,被 `from_args` 装进
-        // `SkillReference::SkillPath(name)` 槽位(避免 proto schema 变更)。
-        // 这里在 cache miss 时按 name 反查真实 SKILL.md 路径,覆盖 Skill 管理器
-        // 能看到的所有 skill(文件 skill + bundled skill)。
-        // `SkillReference::Path` 现在承载 `LocalOrRemotePath`;name 形态的引用
-        // 只可能落在 `Local` 分支上,远程路径直接跳过 name 反查。
-        if let SkillReference::Path(p) = skill_ref
-            && let Some(local_path) = p.to_local_path()
-        {
-            if let Some(candidate_name) = name_candidate(local_path) {
-                if let Some(skill) = manager.find_skill_by_name(candidate_name) {
-                    send_telemetry_from_ctx!(
-                        SkillTelemetryEvent::Read {
-                            reference: skill_ref.clone(),
-                            name: Some(skill.name.clone()),
-                            scope: Some(skill.scope),
-                            provider: Some(skill.provider),
-                            error: false,
-                        },
-                        ctx
-                    );
-                    return success_execution(skill);
-                }
-            }
-        }
+        // BYOP 已在生成 action 前按会话清单解析名称；执行器只接受真实引用。
+        // 不从全局名称索引兜底，避免命中本机或其他远端的同名技能。
 
         // Cache miss 兜底:对于 `SkillReference::Path` 形式的引用,
         // 如果路径形状是合法的 skill 文件
@@ -172,22 +147,6 @@ fn success_execution(
         None,
     );
     ActionExecution::Sync(ReadSkillResult::Success { content }.into())
-}
-
-/// 判断 `SkillReference::Path` 中的值是否应当被当作 skill **name** 反查。
-///
-/// 真实 SKILL.md 路径包含路径分隔符(`/` 或 `\`)或是绝对路径,而 BYOP
-/// 工具调用的 name(如 `"build-feature"`)是纯字符串。把这两类区分开,
-/// 避免把 `/home/.../SKILL.md` 误解为 name 而错过文件系统 fallback。
-fn name_candidate(p: &Path) -> Option<&str> {
-    if p.is_absolute() {
-        return None;
-    }
-    let s = p.to_str()?;
-    if s.is_empty() || s.contains('/') || s.contains('\\') {
-        return None;
-    }
-    Some(s)
 }
 
 impl Entity for ReadSkillExecutor {

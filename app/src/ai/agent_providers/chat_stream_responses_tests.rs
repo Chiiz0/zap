@@ -1,7 +1,17 @@
+use std::path::PathBuf;
+
+use ai::skills::{SkillProvider, SkillReference, SkillScope};
+use mockito::Matcher;
+use warp_util::local_or_remote_path::LocalOrRemotePath;
+
 use super::*;
+use crate::ai::agent::api::{
+    ConversionParams, ConvertAPIMessageToClientOutputMessage, MaybeAIAgentOutputMessage,
+};
+use crate::ai::agent::task::TaskId;
+use crate::ai::agent::{AIAgentActionType, AIAgentOutputMessageType};
 use crate::ai::agent_providers::responses::response_request_context_fingerprint;
 use crate::settings::{AgentProviderResponsesOptions, ResponsesStateModeSetting};
-use mockito::Matcher;
 
 const COMPLETED_RESPONSES_STREAM: &str = concat!(
     "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"delta\":\"完成\"}\n\n",
@@ -55,6 +65,259 @@ async fn collect_responses_request(
         .map(|event| event.expect("提供商应正常完成响应"))
         .collect()
         .await
+}
+
+#[cfg(windows)]
+const STREAM_SKILL_PATH: &str = r"C:\Users\member\.agents\skills\localmind\SKILL.md";
+#[cfg(not(windows))]
+const STREAM_SKILL_PATH: &str = "/home/member/.agents/skills/localmind/SKILL.md";
+
+fn skill_stream_params() -> RequestParams {
+    let mut params = responses_continuation_params();
+    let AIAgentInput::UserQuery { context, .. } = &mut params.input[0] else {
+        panic!("技能流测试必须从用户输入开始");
+    };
+    *context = vec![AIAgentContext::Skills {
+        skills: vec![SkillDescriptor {
+            reference: SkillReference::Path(LocalOrRemotePath::Local(PathBuf::from(
+                STREAM_SKILL_PATH,
+            ))),
+            name: "localmind".to_owned(),
+            description: "测试技能".to_owned(),
+            scope: SkillScope::Home,
+            provider: SkillProvider::Agents,
+            icon_override: None,
+        }],
+    }]
+    .into();
+    params
+}
+
+fn skill_responses_stream(final_name: &str) -> String {
+    // 中间帧已经是合法参数；终帧的权威条目可以覆盖它，不能提前留下可执行动作。
+    let events = [
+        json!({
+            "type": "response.output_item.added",
+            "sequence_number": 1,
+            "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_skill", "call_id": "skill-call",
+                "name": "read_skill", "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "sequence_number": 2,
+            "output_index": 0,
+            "delta": r#"{"name":"localmind"}"#
+        }),
+        json!({
+            "type": "response.completed",
+            "sequence_number": 3,
+            "response": {
+                "id": "resp_skill", "status": "completed",
+                "output": [{
+                    "type": "function_call", "id": "fc_skill", "call_id": "skill-call",
+                    "name": "read_skill", "arguments": json!({ "name": final_name }).to_string()
+                }],
+                "usage": { "input_tokens": 1000, "output_tokens": 10, "total_tokens": 1010 }
+            }
+        }),
+    ];
+    events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+}
+
+fn skill_stream_messages(events: &[api::ResponseEvent]) -> Vec<api::Message> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let Some(api::response_event::Type::ClientActions(actions)) = &event.r#type else {
+                return None;
+            };
+            Some(&actions.actions)
+        })
+        .flatten()
+        .flat_map(|action| match &action.action {
+            Some(api::client_action::Action::AddMessagesToTask(add)) => add.messages.clone(),
+            Some(api::client_action::Action::UpdateTaskMessage(_)) => {
+                panic!("技能参数应在终帧一次生成，不应更新中间占位卡");
+            }
+            // 本测试只收集消息；初始化和完成事件不写入任务历史。
+            _ => vec![],
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn responses技能终帧不可用时不遗留中间动作且下一轮可以重试() {
+    let mut server = mockito::Server::new_async().await;
+    let count = server
+        .mock("POST", "/v1/responses/input_tokens")
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"input_tokens":1000}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let response = server
+        .mock("POST", "/v1/responses")
+        .with_header("content-type", "text/event-stream")
+        .with_body(skill_responses_stream("not-listed"))
+        .expect(1)
+        .create_async()
+        .await;
+    let mut params = skill_stream_params();
+
+    let events = collect_responses_request(
+        params.clone(),
+        format!("{}/v1", server.url()),
+        AgentProviderResponsesOptions::default(),
+    )
+    .await;
+
+    count.assert_async().await;
+    response.assert_async().await;
+    let messages = skill_stream_messages(&events);
+    let tool_calls = messages
+        .iter()
+        .filter_map(|message| {
+            let Some(api::message::Message::ToolCall(call)) = &message.message else {
+                return None;
+            };
+            Some((message, call))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tool_calls.len(), 1, "不能残留已经解析的中间 ReadSkill 动作");
+    let (carrier, call) = tool_calls[0];
+    assert_eq!(call.tool_call_id, "skill-call");
+    assert!(call.tool.is_none());
+    assert_eq!(
+        serialize_outgoing_tool_call(call, None, &carrier.server_message_data),
+        ("read_skill".to_owned(), json!({ "name": "not-listed" }))
+    );
+    let results = messages
+        .iter()
+        .filter_map(|message| {
+            let Some(api::message::Message::ToolCallResult(result)) = &message.message else {
+                return None;
+            };
+            Some((message, result))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].1.tool_call_id, "skill-call");
+    let error: Value = serde_json::from_str(&results[0].0.server_message_data).unwrap();
+    assert_eq!(error["error"], "skill_unavailable");
+
+    params.tasks = vec![api::Task {
+        id: "task-1".to_owned(),
+        messages,
+        ..Default::default()
+    }];
+    params.byop_target_task_id = Some("task-1".to_owned());
+    assert_eq!(
+        classify_byop_controller_readiness(&params).state,
+        ReadinessState::Ready
+    );
+    let request = build_chat_request(
+        &params,
+        true,
+        false,
+        false,
+        AgentProviderApiType::OpenAiResp,
+        Default::default(),
+    )
+    .expect("错误工具回执应允许重新构建下一轮请求")
+    .0;
+    // 原生 Responses 历史以 Custom 条目保留在 sidecar 中；验证真正出站的 JSON，
+    // 而非只检查通用 ToolCall 视图，后者有意跳过这些条目以避免重复回放。
+    let payload =
+        genai::responses::build_request_payload("gpt-5.6", request, &ChatOptions::default(), true)
+            .expect("错误回执必须能序列化为下一轮 Responses 请求");
+    let replayed_items = payload["input"].as_array().expect("input 必须是数组");
+    let replayed_calls = replayed_items
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .collect::<Vec<_>>();
+    assert_eq!(replayed_calls.len(), 1);
+    assert_eq!(replayed_calls[0]["call_id"], "skill-call");
+    assert_eq!(replayed_calls[0]["name"], "read_skill");
+    let replayed_arguments: Value =
+        serde_json::from_str(replayed_calls[0]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(replayed_arguments, json!({ "name": "not-listed" }));
+    let replayed_results = replayed_items
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .collect::<Vec<_>>();
+    assert_eq!(replayed_results.len(), 1);
+    assert_eq!(replayed_results[0]["call_id"], "skill-call");
+    let replayed_error: Value =
+        serde_json::from_str(replayed_results[0]["output"].as_str().unwrap()).unwrap();
+    assert_eq!(replayed_error["error"], "skill_unavailable");
+}
+
+#[tokio::test]
+async fn responses已列出技能只在终帧生成一次可执行动作() {
+    let mut server = mockito::Server::new_async().await;
+    let count = server
+        .mock("POST", "/v1/responses/input_tokens")
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"input_tokens":1000}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let response = server
+        .mock("POST", "/v1/responses")
+        .with_header("content-type", "text/event-stream")
+        .with_body(skill_responses_stream("localmind"))
+        .expect(1)
+        .create_async()
+        .await;
+
+    let events = collect_responses_request(
+        skill_stream_params(),
+        format!("{}/v1", server.url()),
+        AgentProviderResponsesOptions::default(),
+    )
+    .await;
+
+    count.assert_async().await;
+    response.assert_async().await;
+    let messages = skill_stream_messages(&events);
+    let tool_messages = messages
+        .iter()
+        .filter(|message| matches!(message.message, Some(api::message::Message::ToolCall(_))))
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 1);
+    let task_id = TaskId::new("task-1".to_owned());
+    let output = tool_messages[0]
+        .clone()
+        .to_client_output_message(ConversionParams {
+            task_id: &task_id,
+            current_todo_list: None,
+            active_code_review: None,
+            skill_path_origin: &SkillPathOrigin::Local,
+        })
+        .unwrap();
+    let MaybeAIAgentOutputMessage::Message(output) = output else {
+        panic!("终帧技能必须产生客户端消息");
+    };
+    let AIAgentOutputMessageType::Action(action) = output.message else {
+        panic!("终帧技能必须产生客户端动作");
+    };
+    let AIAgentActionType::ReadSkill(request) = action.action else {
+        panic!("终帧动作必须读取技能");
+    };
+    assert_eq!(
+        request.skill,
+        SkillReference::Path(LocalOrRemotePath::Local(PathBuf::from(STREAM_SKILL_PATH)))
+    );
+    assert!(!messages.iter().any(|message| matches!(
+        message.message,
+        Some(api::message::Message::ToolCallResult(_))
+    )));
 }
 
 #[tokio::test]
@@ -469,7 +732,8 @@ fn responses工具调用在本地解析前删除可选null() {
     normalize_responses_tool_call_arguments(&mut call);
 
     assert_eq!(call.fn_arguments, json!({"command": "pwd"}));
-    parse_incoming_tool_call(&call, None).expect("恢复缺省参数后应能转换为内部工具调用");
+    parse_incoming_tool_call(&call, None, &[], &SkillPathOrigin::Local)
+        .expect("恢复缺省参数后应能转换为内部工具调用");
 }
 
 #[test]

@@ -140,16 +140,18 @@ impl SkillManager {
         // the home directory as their dir_path; project skills use their owning directory.
         let mut skill_paths = Vec::new();
         let mut deduplicator = SkillDeduplicator::default();
-        let path_matches_location = |path: &LocalOrRemotePath| match (working_directory, path) {
-            (Some(LocalOrRemotePath::Local(_)), LocalOrRemotePath::Local(_)) => true,
-            (
-                Some(LocalOrRemotePath::Remote(working_directory)),
-                LocalOrRemotePath::Remote(path),
-            ) => working_directory.host_id == path.host_id,
-            (None, LocalOrRemotePath::Local(_)) => self.is_cloud_environment,
-            (Some(LocalOrRemotePath::Local(_)), LocalOrRemotePath::Remote(_))
-            | (Some(LocalOrRemotePath::Remote(_)), LocalOrRemotePath::Local(_))
-            | (None, LocalOrRemotePath::Remote(_)) => false,
+        // cwd 未知时也按执行主机隔离目录,云模式只能扩大同一主机内的项目范围。
+        let path_matches_location = |path: &LocalOrRemotePath| match (path_origin, path) {
+            (SkillPathOrigin::Local, LocalOrRemotePath::Local(_)) => true,
+            (SkillPathOrigin::Remote { host_id }, LocalOrRemotePath::Remote(path)) => {
+                host_id == &path.host_id
+            }
+            (SkillPathOrigin::Local, LocalOrRemotePath::Remote(_))
+            | (SkillPathOrigin::Remote { .. }, LocalOrRemotePath::Local(_))
+            | (
+                SkillPathOrigin::RestoredDisplayOnly | SkillPathOrigin::Unavailable,
+                LocalOrRemotePath::Local(_) | LocalOrRemotePath::Remote(_),
+            ) => false,
         };
 
         if let Some(home_dir) = self.home_directory_for_origin(path_origin)
@@ -179,7 +181,7 @@ impl SkillManager {
                 .get_root_for_path(working_directory);
 
             for (dir, dir_skill_paths) in &self.directory_skills {
-                if self.is_home_directory(dir) {
+                if self.is_home_directory(dir) || !path_matches_location(dir) {
                     continue;
                 }
                 // Only include skills from directories that are ancestors of the working directory

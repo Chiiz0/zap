@@ -8,10 +8,9 @@
 //! ## 入参契约
 //!
 //! BYOP 路径暴露 `name` 字段,值取自 system prompt `<available_skills><skill><name>`。
-//! `from_args` 把 name 装入 proto 的 `SkillReference::SkillPath` 槽位(不改 proto),
-//! 由 `read_skill` executor 在 cache miss 时先按 name 反查到真实 SKILL.md 绝对路径
-//! 再读盘。这条 fallback 也兼容模型万一直接传绝对路径或 bundled 形式
-//! `@warp-skill:<id>` 的旧写法。
+//! `from_args` 保留模型传入的名称,由流式适配层在本轮技能清单中解析真实引用。
+//! 解析时校验会话主机,避免本地和不同远端的同名技能相互串用。
+//! 同名技能可通过清单中的完整路径区分,兼容本地 bundled 的 `@warp-skill:<id>`。
 //!
 //! ## 使用建议(写到 description)
 //!
@@ -19,12 +18,24 @@
 //! - 用户提到 skill 名 / 文件名 / 路径
 //! - 任务匹配某 skill 描述(如"做 PR review" 触发 `review` skill)
 
+use ai::skills::{SkillPathOrigin, SkillReference};
 use anyhow::Result;
+use api::message::tool_call::read_skill::SkillReference as ApiSkillReference;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use warp_multi_agent_api as api;
+use warp_util::local_or_remote_path::LocalOrRemotePath;
 
 use super::OpenAiTool;
+use crate::ai::skills::SkillDescriptor;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SkillResolutionError {
+    #[error("{}", crate::t!("ai-error-skill-not-available"))]
+    NotAvailable,
+    #[error("{}", crate::t!("ai-error-skill-name-ambiguous"))]
+    Ambiguous,
+}
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -37,7 +48,7 @@ fn parameters() -> Value {
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Skill 名称(与 system prompt 内 <available_skills><skill><name> 字段完全一致)。"
+                "description": "Skill 名称(与 system prompt 内 <available_skills><skill><name> 字段完全一致),同名时传清单中的完整 skill_path。"
             }
         },
         "required": ["name"],
@@ -46,16 +57,55 @@ fn parameters() -> Value {
 }
 
 fn from_args(args: &str) -> Result<api::message::tool_call::Tool> {
-    use api::message::tool_call::read_skill::SkillReference;
     let parsed: Args = serde_json::from_str(args)?;
-    // 复用 proto 的 `SkillPath` 槽位携带 name(避免 proto schema 变更);
-    // executor 端在 cache miss 时按 name 反查真实 SKILL.md 路径。
     Ok(api::message::tool_call::Tool::ReadSkill(
         api::message::tool_call::ReadSkill {
-            skill_reference: Some(SkillReference::SkillPath(parsed.name)),
-            name: String::new(),
+            skill_reference: None,
+            name: parsed.name,
         },
     ))
+}
+
+/// 只解析本轮已列出的技能,并在生成客户端 action 前还原完整路径和主机来源。
+pub fn resolve_reference(
+    read_skill: &mut api::message::tool_call::ReadSkill,
+    skills: &[SkillDescriptor],
+    path_origin: &SkillPathOrigin,
+) -> Result<(), SkillResolutionError> {
+    let mut candidates = skills.iter().filter(|skill| {
+        let same_host = match path_origin {
+            SkillPathOrigin::Local => matches!(
+                &skill.reference,
+                SkillReference::Path(LocalOrRemotePath::Local(_))
+                    | SkillReference::BundledSkillId(_)
+            ),
+            SkillPathOrigin::Remote { host_id } => matches!(
+                &skill.reference,
+                SkillReference::Path(LocalOrRemotePath::Remote(path)) if &path.host_id == host_id
+            ),
+            // 历史显示身份和缺失主机身份都不能用于执行。
+            SkillPathOrigin::RestoredDisplayOnly | SkillPathOrigin::Unavailable => false,
+        };
+        same_host
+            && (skill.name == read_skill.name
+                || match &skill.reference {
+                    SkillReference::Path(path) => path.display_path() == read_skill.name,
+                    SkillReference::BundledSkillId(id) => {
+                        format!("@warp-skill:{id}") == read_skill.name
+                    }
+                })
+    });
+    let selected = candidates
+        .next()
+        .ok_or(SkillResolutionError::NotAvailable)?;
+    if candidates.any(|candidate| candidate.reference != selected.reference) {
+        return Err(SkillResolutionError::Ambiguous);
+    }
+    read_skill.skill_reference = Some(match &selected.reference {
+        SkillReference::Path(path) => ApiSkillReference::SkillPath(path.display_path()),
+        SkillReference::BundledSkillId(id) => ApiSkillReference::BundledSkillId(id.clone()),
+    });
+    Ok(())
 }
 
 fn result_to_json(result: &api::message::tool_call_result::Result) -> Option<Value> {

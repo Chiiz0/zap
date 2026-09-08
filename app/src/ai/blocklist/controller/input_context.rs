@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Local;
@@ -8,6 +7,7 @@ use regex::Regex;
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, SingletonEntity};
 
+use super::SessionContext;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{
     AIAgentAttachment, AIAgentContext, DocumentContentAttachmentSource, DriveObjectPayload,
@@ -71,8 +71,10 @@ pub(super) fn input_context_for_request(
         // 项目去云端后,system prompt 每轮在客户端完整重渲(BYOP 无状态),
         // skills 必须每轮全量送达,不再做差量。空列表时也不 push,保持
         // context 紧凑(模板侧 `{% if skills %}` 守卫即可正常省略 section)。
+        let path_origin = SessionContext::from_session(active_session, app).skill_path_origin();
         let skills = list_skills(
-            active_session.current_working_directory().map(Path::new),
+            current_working_directory_location.as_ref(),
+            &path_origin,
             app,
         );
         if !skills.is_empty() {

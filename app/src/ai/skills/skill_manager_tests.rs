@@ -1145,6 +1145,144 @@ fn get_skills_for_working_directory_respects_location() {
 }
 
 #[test]
+fn cloud_skill_catalog_uses_remote_origin_when_cwd_is_unknown() {
+    App::test((), |mut app| async move {
+        let bundled_detection = FeatureFlag::BundledSkills.override_enabled(false);
+        app.add_singleton_model(DirectoryWatcher::new);
+        app.add_singleton_model(AISettings::new_with_defaults);
+        app.add_singleton_model(|_| DetectedRepositories::default());
+        app.add_singleton_model(RepoMetadataModel::new);
+        app.add_singleton_model(HomeDirectoryWatcher::new_for_test);
+        app.add_singleton_model(WarpManagedPathsWatcher::new_for_testing);
+        let handle = app.add_singleton_model(SkillManager::new);
+        drop(bundled_detection);
+        let _bundled_skills = FeatureFlag::BundledSkills.override_enabled(true);
+        let host_id = HostId::new("remote-host".to_owned());
+        let other_host_id = HostId::new("other-host".to_owned());
+
+        handle.update(&mut app, |manager, _| {
+            manager.is_cloud_environment = true;
+            manager.handle_skills_added(vec![
+                make_skill("local-project", ".agents"),
+                make_remote_skill(&host_id, "remote-project"),
+                make_remote_skill(&other_host_id, "other-project"),
+            ]);
+            manager.set_remote_home_skills(
+                host_id.clone(),
+                remote_test_path(&host_id, "/home/user"),
+                vec![make_remote_home_skill(
+                    &host_id,
+                    "remote-home",
+                    "home skill",
+                )],
+            );
+            manager.add_bundled_skill_for_testing(
+                "bundled",
+                ParsedSkill {
+                    path: LocalOrRemotePath::Local(
+                        std::env::temp_dir().join("bundled/skills/local-bundled/SKILL.md"),
+                    ),
+                    ..bundled_test_skill("local-bundled", "local bundled skill")
+                },
+                BundledSkillActivation::Always,
+            );
+            manager.add_remote_bundled_skill_for_testing(
+                host_id.clone(),
+                "bundled",
+                ParsedSkill {
+                    scope: SkillScope::Bundled,
+                    ..make_remote_skill(&host_id, "remote-bundled")
+                },
+                BundledSkillActivation::Always,
+            );
+            manager.add_remote_bundled_skill_for_testing(
+                other_host_id.clone(),
+                "bundled",
+                ParsedSkill {
+                    scope: SkillScope::Bundled,
+                    ..make_remote_skill(&other_host_id, "other-bundled")
+                },
+                BundledSkillActivation::Always,
+            );
+        });
+
+        handle.read(&app, |manager, ctx| {
+            let skills = manager.get_skills_for_working_directory_with_origin(
+                None,
+                &SkillPathOrigin::Remote { host_id },
+                ctx,
+            );
+            let names: HashSet<_> = skills.iter().map(|skill| skill.name.as_str()).collect();
+            assert_eq!(
+                names,
+                HashSet::from(["remote-home", "remote-project", "remote-bundled"])
+            );
+            assert_eq!(
+                manager.get_skills_for_working_directory_with_origin(
+                    None,
+                    &SkillPathOrigin::Unavailable,
+                    ctx,
+                ),
+                Vec::new()
+            );
+        });
+    });
+}
+
+#[test]
+fn project_skill_catalog_rejects_cwd_from_another_execution_host() {
+    App::test((), |mut app| async move {
+        let _bundled_skills = FeatureFlag::BundledSkills.override_enabled(false);
+        app.add_singleton_model(DirectoryWatcher::new);
+        app.add_singleton_model(AISettings::new_with_defaults);
+        app.add_singleton_model(|_| DetectedRepositories::default());
+        app.add_singleton_model(RepoMetadataModel::new);
+        app.add_singleton_model(HomeDirectoryWatcher::new_for_test);
+        app.add_singleton_model(WarpManagedPathsWatcher::new_for_testing);
+        let handle = app.add_singleton_model(SkillManager::new);
+        let other_host_id = HostId::new("other-host".to_owned());
+        let local_cwd = LocalOrRemotePath::Local(std::env::temp_dir().join("repo"));
+
+        handle.update(&mut app, |manager, _| {
+            manager.handle_skills_added(vec![
+                make_skill("local-project", ".agents"),
+                make_remote_skill(&other_host_id, "other-project"),
+            ]);
+        });
+
+        handle.read(&app, |manager, ctx| {
+            let origin = SkillPathOrigin::Remote {
+                host_id: HostId::new("remote-host".to_owned()),
+            };
+            assert_eq!(
+                manager.get_skills_for_working_directory_with_origin(
+                    Some(&local_cwd),
+                    &origin,
+                    ctx,
+                ),
+                Vec::new()
+            );
+            assert_eq!(
+                manager.get_skills_for_working_directory_with_origin(
+                    Some(&remote_test_path(&other_host_id, "/repo")),
+                    &origin,
+                    ctx,
+                ),
+                Vec::new()
+            );
+            assert_eq!(
+                manager.get_skills_for_working_directory_with_origin(
+                    Some(&local_cwd),
+                    &SkillPathOrigin::Unavailable,
+                    ctx,
+                ),
+                Vec::new()
+            );
+        });
+    });
+}
+
+#[test]
 fn feature_gated_bundled_skill_is_listed_only_when_enabled() {
     App::test((), |mut app| async move {
         app.add_singleton_model(DirectoryWatcher::new);

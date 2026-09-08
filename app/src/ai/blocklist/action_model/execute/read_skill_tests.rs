@@ -258,11 +258,9 @@ fn test_read_skill_executor_fallback_returns_error_when_file_missing() {
     });
 }
 
-/// BYOP `read_skill` 工具用 name 调用时:
-/// `from_args` 把 name 装进 `SkillReference::SkillPath(name)`,
-/// executor 端 cache miss 后按 name 反查命中并 Sync Success 返回。
+/// 未解析的名称不能绕过会话清单去全局缓存查找技能。
 #[test]
-fn test_read_skill_executor_resolves_by_name() {
+fn test_read_skill_executor_rejects_unresolved_name_even_if_cached() {
     let temp_dir = TempDir::new().unwrap();
     let skill_path = create_test_skill_file(&temp_dir, "byop-named-skill", "Lookup by name");
 
@@ -276,7 +274,7 @@ fn test_read_skill_executor_resolves_by_name() {
 
         let executor_handle = app.add_model(|_| ReadSkillExecutor::new());
 
-        // 模拟 BYOP from_args:把 name 当作 path 传入。
+        // 模拟未经会话来源解析就直接传入名称。
         let action = AIAgentAction {
             id: AIAgentActionId::from("name-lookup-action".to_string()),
             action: AIAgentActionType::ReadSkill(ReadSkillRequest {
@@ -297,19 +295,20 @@ fn test_read_skill_executor_resolves_by_name() {
             let result: AnyActionExecution = executor.execute(input, ctx).into();
             match result {
                 AnyActionExecution::Sync(AIAgentActionResultType::ReadSkill(
-                    ReadSkillResult::Success { content },
+                    ReadSkillResult::Error(message),
                 )) => {
-                    assert_eq!(content.file_name, skill_path.to_string_lossy().to_string());
+                    assert!(message.starts_with("Skill not found"));
                 }
-                _ => panic!("Lookup by name should succeed via Sync Success"),
+                AnyActionExecution::Sync(_)
+                | AnyActionExecution::Async { .. }
+                | AnyActionExecution::NotReady
+                | AnyActionExecution::InvalidAction => panic!("未解析的名称必须返回技能错误"),
             }
         });
     });
 }
 
-/// 未知 name(不在 SkillManager 索引中)走完所有 fallback 后:
-/// `name_candidate` 命中但 `find_skill_by_name` 返回 None,继续到 fs fallback —
-/// 此处路径形状不合法(纯 name 不含 `/`),直接 Sync Error。
+/// 未知名称不触发全局查找或磁盘读取。
 #[test]
 fn test_read_skill_executor_rejects_unknown_name() {
     App::test((), |mut app| async move {
