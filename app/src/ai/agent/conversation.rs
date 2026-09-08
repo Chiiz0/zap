@@ -3286,22 +3286,52 @@ impl AIConversation {
                     .task_store
                     .remove(&task_id)
                     .ok_or(UpdateConversationError::TaskNotFound)?;
-                let added_exchanges = self
-                    .added_exchanges_by_response
-                    .get(response_stream_id)
-                    .ok_or(UpdateConversationError::NoPendingRequest)?;
-                let exchange_id = if let Some(info) =
-                    added_exchanges.iter().find(|info| info.task_id == task_id)
-                {
-                    info.exchange_id
-                } else {
-                    let existing_exchange = self
-                        .get_task(&added_exchanges.last().task_id)
-                        .ok_or(UpdateConversationError::TaskNotFound)?
-                        .exchange(added_exchanges.last().exchange_id)
-                        .ok_or(UpdateConversationError::ExchangeNotFound)?;
-                    let new_exchange_id = task.append_new_exchange(existing_exchange);
-                    if self.optimistic_cli_subagent_subtask_id.is_some() && task.is_root_task() {
+                // 移出 task 只是为了解除借用；所有失败路径都必须先放回，再向上传播错误。
+                let update_result = (|| -> Result<_, UpdateConversationError> {
+                    let added_exchanges = self
+                        .added_exchanges_by_response
+                        .get(response_stream_id)
+                        .ok_or(UpdateConversationError::NoPendingRequest)?;
+                    let (exchange_id, is_new_exchange) = if let Some(info) =
+                        added_exchanges.iter().find(|info| info.task_id == task_id)
+                    {
+                        (info.exchange_id, false)
+                    } else {
+                        let existing_exchange = self
+                            .get_task(&added_exchanges.last().task_id)
+                            .ok_or(UpdateConversationError::TaskNotFound)?
+                            .exchange(added_exchanges.last().exchange_id)
+                            .ok_or(UpdateConversationError::ExchangeNotFound)?;
+                        (task.append_new_exchange(existing_exchange), true)
+                    };
+
+                    let current_comment_state = self.code_review.as_ref().cloned();
+                    if let Err(error) = task.add_messages(
+                        messages,
+                        exchange_id,
+                        TaskMessageContext {
+                            current_todo_list: current_todo_list.as_ref(),
+                            active_code_review: current_comment_state.as_ref(),
+                            skill_path_origin,
+                        },
+                        // In shared-session viewers, we have to reconstruct what the original user input
+                        // was using subsequent conversation messages (as the original input was not
+                        // sent on this client). Once we reconstruct these inputs, we will insert them
+                        // to mimic the normal conversation flow. (If this is not a shared session, the
+                        // exchange inputs will already be populated).
+                        self.is_viewing_shared_session,
+                    ) {
+                        // 转换失败时不保留为这批消息临时创建的空 exchange。
+                        if is_new_exchange {
+                            task.remove_exchange(exchange_id);
+                        }
+                        return Err(error.into());
+                    }
+
+                    if is_new_exchange
+                        && self.optimistic_cli_subagent_subtask_id.is_some()
+                        && task.is_root_task()
+                    {
                         // If we are lazily creating a new exchange at this point, this means we are updating
                         // a new task for the first time in this response stream.
                         //
@@ -3315,33 +3345,14 @@ impl AIConversation {
                         // The real fix here is to lazily create exchanges only when there are real messages to be
                         // rendered, or at the very least, lazily create AI blocks for an exchange only once the exchange
                         // actually has renderable content.
-                        self.hidden_exchanges.insert(new_exchange_id);
+                        self.hidden_exchanges.insert(exchange_id);
                     }
-                    new_exchange_id
-                };
-
-                let current_comment_state = self.code_review.as_ref().cloned();
-                task.add_messages(
-                    messages,
-                    exchange_id,
-                    TaskMessageContext {
-                        current_todo_list: current_todo_list.as_ref(),
-                        active_code_review: current_comment_state.as_ref(),
-                        skill_path_origin,
-                    },
-                    // In shared-session viewers, we have to reconstruct what the original user input
-                    // was using subsequent conversation messages (as the original input was not
-                    // sent on this client). Once we reconstruct these inputs, we will insert them
-                    // to mimic the normal conversation flow. (If this is not a shared session, the
-                    // exchange inputs will already be populated).
-                    self.is_viewing_shared_session,
-                )?;
+                    Ok((exchange_id, is_new_exchange))
+                })();
 
                 self.task_store.insert(task);
-                if !added_exchanges
-                    .iter()
-                    .any(|new_exchange_info| new_exchange_info.exchange_id == exchange_id)
-                {
+                let (exchange_id, is_new_exchange) = update_result?;
+                if is_new_exchange {
                     self.added_exchanges_by_response
                         .get_mut(response_stream_id)
                         .ok_or(UpdateConversationError::NoPendingRequest)?
@@ -5401,3 +5412,7 @@ mod tests;
 #[cfg(test)]
 #[path = "conversation_recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "conversation_message_failure_tests.rs"]
+mod message_failure_tests;

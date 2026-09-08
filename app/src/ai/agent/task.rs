@@ -25,9 +25,8 @@ use super::api::{
 use super::comment::CodeReview;
 use super::conversation::{context_in_exchanges, update_todo_list_from_todo_op};
 use super::{
-    AIAgentContext, AIAgentExchange, AIAgentExchangeId, AIAgentOutput, AIAgentOutputMessage,
-    AIAgentOutputStatus, MaybeAIAgentOutputMessage, MessageId, MessageToAIAgentOutputMessageError,
-    Shared,
+    AIAgentContext, AIAgentExchange, AIAgentExchangeId, AIAgentOutput, AIAgentOutputStatus,
+    MaybeAIAgentOutputMessage, MessageId, MessageToAIAgentOutputMessageError, Shared,
 };
 use crate::AIAgentTodoList;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
@@ -972,16 +971,37 @@ impl Task {
         message_context: TaskMessageContext<'_>,
         should_convert_input_messages: bool,
     ) -> Result<(), UpdateTaskError> {
+        let task_id = self.id.clone();
         let exchange = self
             .exchange_mut(exchange_id)
             .ok_or(UpdateTaskError::ExchangeNotFound)?;
-        exchange
-            .added_message_ids
-            .extend(messages.iter().map(|m| MessageId::new(m.id.clone())));
+        let output = exchange.get_streaming_output()?;
+        let added_message_ids = messages
+            .iter()
+            .map(|message| MessageId::new(message.id.clone()))
+            .collect::<Vec<_>>();
+        let user_inputs =
+            should_convert_input_messages.then(|| user_inputs_from_messages(&messages));
+        // 整批消息转换成功后再写入 exchange，避免错误消息留下编号或共享会话输入。
+        let output_messages = messages
+            .into_iter()
+            .filter_map(|message| {
+                match message.to_client_output_message(ConversionParams {
+                    task_id: &task_id,
+                    current_todo_list: message_context.current_todo_list,
+                    active_code_review: message_context.active_code_review,
+                    skill_path_origin: message_context.skill_path_origin,
+                }) {
+                    Ok(MaybeAIAgentOutputMessage::Message(message)) => Some(Ok(message)),
+                    Ok(MaybeAIAgentOutputMessage::NoClientRepresentation) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>, MessageToAIAgentOutputMessageError>>()?;
 
-        if should_convert_input_messages {
-            let user_inputs = user_inputs_from_messages(&messages);
+        exchange.added_message_ids.extend(added_message_ids);
 
+        if let Some(user_inputs) = user_inputs {
             for input in user_inputs.into_iter() {
                 // If the input is an ActionResult with an action ID that already exists,
                 // replace the existing one (to handle updates to long-running commands).
@@ -1003,24 +1023,7 @@ impl Task {
             }
         }
 
-        let output = exchange.get_streaming_output()?;
-        let output_messages: Result<Vec<AIAgentOutputMessage>, MessageToAIAgentOutputMessageError> =
-            messages
-                .into_iter()
-                .filter_map(|m| {
-                    match m.to_client_output_message(ConversionParams {
-                        task_id: &self.id,
-                        current_todo_list: message_context.current_todo_list,
-                        active_code_review: message_context.active_code_review,
-                        skill_path_origin: message_context.skill_path_origin,
-                    }) {
-                        Ok(MaybeAIAgentOutputMessage::Message(m)) => Some(Ok(m)),
-                        Ok(MaybeAIAgentOutputMessage::NoClientRepresentation) => None,
-                        Err(e) => Some(Err(e)),
-                    }
-                })
-                .collect();
-        output.get_mut().messages.extend(output_messages?);
+        output.get_mut().messages.extend(output_messages);
         Ok(())
     }
 }

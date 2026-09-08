@@ -5,7 +5,7 @@ use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use ai::skills::{
-    ParsedSkill, SKILL_PROVIDER_DEFINITIONS, SkillProvider, home_skills_path,
+    ParsedSkill, SKILL_PROVIDER_DEFINITIONS, SkillPathOrigin, SkillProvider, home_skills_path,
     provider_parent_directory_for_skills_root, provider_rank,
 };
 use warp_core::ui::Icon;
@@ -134,10 +134,26 @@ pub(crate) fn unique_skills(
 /// `/chat/completions`,system prompt 每轮在客户端完整重渲染,数据必须每轮都送达,
 /// 否则第二轮起 system prompt 里 skills section 会消失。
 /// 因此简化为每轮全量返回。
-pub fn list_skills(working_directory: Option<&Path>, app: &AppContext) -> Vec<SkillDescriptor> {
-    let working_directory =
-        working_directory.map(|path| LocalOrRemotePath::Local(path.to_path_buf()));
-    SkillManager::as_ref(app).get_skills_for_working_directory(working_directory.as_ref(), app)
+pub fn list_skills(
+    working_directory: Option<&LocalOrRemotePath>,
+    path_origin: &SkillPathOrigin,
+    ctx: &AppContext,
+) -> Vec<SkillDescriptor> {
+    // SSH 启动或切换主机时 cwd 可能未知或仍属于上一会话,来源必须以执行主机为准。
+    let working_directory = match path_origin {
+        SkillPathOrigin::Local => {
+            working_directory.filter(|path| matches!(path, LocalOrRemotePath::Local(_)))
+        }
+        SkillPathOrigin::Remote { host_id } => working_directory.filter(
+            |path| matches!(path, LocalOrRemotePath::Remote(path) if &path.host_id == host_id),
+        ),
+        SkillPathOrigin::Unavailable | SkillPathOrigin::RestoredDisplayOnly => return Vec::new(),
+    };
+    SkillManager::as_ref(ctx).get_skills_for_working_directory_with_origin(
+        working_directory,
+        path_origin,
+        ctx,
+    )
 }
 
 /// Renders an 'open skill' button for blocklist AI actions and the code diff view.

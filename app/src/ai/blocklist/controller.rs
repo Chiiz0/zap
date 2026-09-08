@@ -141,6 +141,8 @@ impl SessionContext {
                 host_id: host_id.clone(),
             },
             Some(SessionType::WarpifiedRemote { host_id: None }) => SkillPathOrigin::Unavailable,
+            // 普通 SSH 包装会话的类型仍是 Local,但不能因此暴露本机技能。
+            Some(SessionType::Local) | None if self.is_legacy_ssh => SkillPathOrigin::Unavailable,
             Some(SessionType::Local) | None => SkillPathOrigin::Local,
         }
     }
@@ -4999,3 +5001,7 @@ mod compaction_tests;
 #[cfg(all(test, feature = "local_fs"))]
 #[path = "controller_compaction_crash_tests.rs"]
 mod compaction_crash_tests;
+
+#[cfg(test)]
+#[path = "controller_skill_origin_tests.rs"]
+mod skill_origin_tests;

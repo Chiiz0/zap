@@ -44,6 +44,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use ai::agent::convert::ConvertToAPITypeError;
+use ai::skills::SkillPathOrigin;
 use futures::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
@@ -88,6 +89,7 @@ use crate::ai::byop_readiness::{
     RepairStateStatus, TerminalResultKind, ToolCallKey, ToolCallRef, ToolResultSource,
     classify_projection,
 };
+use crate::ai::skills::SkillDescriptor;
 use crate::settings::{AgentProvider, AgentProviderApiType};
 
 #[cfg(not(target_family = "wasm"))]
@@ -2930,13 +2932,15 @@ fn serialize_outgoing_tool_call(
         ),
         Some(Tool::ReadSkill(r)) => {
             use api::message::tool_call::read_skill::SkillReference;
-            // 模型上一轮传 `name`,被 `from_args` 装进 `SkillPath` 槽位;
-            // 序列化回上游对话历史时改回 `name` 字段,与当前 JSON schema 自洽。
-            // BundledSkillId 用 Display 形式 `@warp-skill:<id>` 与 SkillReference Display 一致。
-            let name = match &r.skill_reference {
-                Some(SkillReference::SkillPath(s)) => s.clone(),
-                Some(SkillReference::BundledSkillId(id)) => format!("@warp-skill:{id}"),
-                None => String::new(),
+            // 新调用保留模型原始名称;旧历史没有 name 时沿用路径或 bundled id。
+            let name = if r.name.is_empty() {
+                match &r.skill_reference {
+                    Some(SkillReference::SkillPath(s)) => s.clone(),
+                    Some(SkillReference::BundledSkillId(id)) => format!("@warp-skill:{id}"),
+                    None => String::new(),
+                }
+            } else {
+                r.name.clone()
             };
             ("read_skill".to_owned(), json!({ "name": name }).to_string())
         }
@@ -4170,6 +4174,20 @@ pub async fn generate_byop_output(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let mcp_context = params.mcp_context.clone();
+    // 与本轮 system prompt 使用同一份技能快照,不回查跨主机的全局名称索引。
+    let skills = latest_input_context(&params.input)
+        .iter()
+        .filter_map(|context| {
+            if let AIAgentContext::Skills { skills } = context {
+                Some(skills.as_slice())
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let skill_path_origin = params.session_context.skill_path_origin();
     let tool_names_for_extract = available_tool_names(&params);
     let response_cancel_control = native_responses_request
         .as_ref()
@@ -4659,10 +4677,12 @@ pub async fn generate_byop_output(
                     // 这里跳过避免双卡。
                     // todowrite / update_machine_memory 走 BYOP 本地拦截器，
                     // 这里跳过无法转换为 action 的占位卡。
+                    // read_skill 等最终参数再解析来源，避免终帧拒绝后残留早先的技能动作。
                     if call.fn_name != tools::webfetch::TOOL_NAME
                         && call.fn_name != tools::websearch::TOOL_NAME
                         && call.fn_name != tools::todowrite::TOOL_NAME
                         && call.fn_name != tools::machine_memory::TOOL_NAME
+                        && call.fn_name != tools::skill::READ_SKILL.name
                     {
                         if let Some(msg_id) = tool_msg_ids.get(&call.call_id).cloned() {
                             // 已 emit 占位 → 节流增量刷新。
@@ -4673,7 +4693,7 @@ pub async fn generate_byop_output(
                                 .unwrap_or(true);
                             if elapsed_ok {
                                 if let Ok(parsed) =
-                                    parse_incoming_tool_call(&call, mcp_context.as_ref())
+                                    parse_incoming_tool_call(&call, mcp_context.as_ref(), &skills, &skill_path_origin)
                                 {
                                     let mut updated = make_tool_call_message(
                                         &current_task_id,
@@ -4692,7 +4712,7 @@ pub async fn generate_byop_output(
                                 // reparse 失败(intermediate 状态):静默,等下次 chunk。
                             }
                         } else if let Ok(parsed) =
-                            parse_incoming_tool_call(&call, mcp_context.as_ref())
+                            parse_incoming_tool_call(&call, mcp_context.as_ref(), &skills, &skill_path_origin)
                         {
                             // 首次 parse 成功 → 立即 emit 占位卡。
                             // 每个 chunk 在未 emit 占位前都会重 parse(即"retry on every
@@ -5224,7 +5244,7 @@ pub async fn generate_byop_output(
                 continue;
             }
 
-            match parse_incoming_tool_call(&call, mcp_context.as_ref()) {
+            match parse_incoming_tool_call(&call, mcp_context.as_ref(), &skills, &skill_path_origin) {
                 Ok(warp_tool) => {
                     // 如果 ToolCallChunk 阶段已经 emit 过占位卡(同 call_id),
                     // 改用 update_message 原地刷新为最终 args(覆盖 chunk 中可能后到
@@ -5268,21 +5288,31 @@ pub async fn generate_byop_output(
                     } else {
                         call.fn_arguments.to_string()
                     };
+                    let error_payload = if let Some(error) = e.downcast_ref::<tools::skill::SkillResolutionError>() {
+                        let code = match error {
+                            tools::skill::SkillResolutionError::NotAvailable => "skill_unavailable",
+                            tools::skill::SkillResolutionError::Ambiguous => "ambiguous_skill_name",
+                        };
+                        serde_json::json!({
+                            "error": code,
+                            "detail": error.to_string(),
+                            "tool": call.fn_name,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "error": "invalid_arguments",
+                            "detail": e.to_string(),
+                            "tool": call.fn_name,
+                            "received_args": &args_str,
+                            "hint": "Arguments did not match the tool's JSON Schema. \
+                                     Re-emit the tool call with corrected types / required fields, \
+                                     or pick a different tool.",
+                        })
+                    };
                     log::warn!(
-                        "[byop] tool_call parse failed → emit synthetic error tool_result: \
-                         tool={} call_id={} err={e:#}",
-                        call.fn_name,
-                        call.call_id
+                        "[byop] 工具调用解析失败，error_type={}",
+                        error_payload["error"]
                     );
-                    let error_payload = serde_json::json!({
-                        "error": "invalid_arguments",
-                        "detail": e.to_string(),
-                        "tool": call.fn_name,
-                        "received_args": &args_str,
-                        "hint": "Arguments did not match the tool's JSON Schema. \
-                                 Re-emit the tool call with corrected types / required fields, \
-                                 or pick a different tool.",
-                    });
                     let error_content = serde_json::to_string(&error_payload)
                         .unwrap_or_else(|_| r#"{"error":"invalid_arguments"}"#.to_owned());
                     final_messages.push(make_tool_call_carrier_message(
@@ -5667,6 +5697,8 @@ async fn dispatch_byop_web_tool(tool_name: &str, args_str: &str) -> Value {
 fn parse_incoming_tool_call(
     call: &ToolCall,
     mcp_ctx: Option<&crate::ai::agent::MCPContext>,
+    skills: &[SkillDescriptor],
+    skill_path_origin: &SkillPathOrigin,
 ) -> anyhow::Result<api::message::tool_call::Tool> {
     // genai ToolCall.fn_arguments 是 Value;tools::* 的 from_args 期望 &str,
     // 把 Value 序列化回字符串后传入(原协议就是字符串 JSON)。
@@ -5681,28 +5713,24 @@ fn parse_incoming_tool_call(
     let Some(tool) = tools::lookup(&call.fn_name) else {
         anyhow::bail!("unknown tool name: {}", call.fn_name);
     };
-    match (tool.from_args)(&args_str) {
-        Ok(t) => Ok(t),
-        Err(e) => {
+    let mut parsed = match (tool.from_args)(&args_str) {
+        Ok(parsed) => parsed,
+        Err(error) => {
             // 第一次失败:大概率是模型把 bool/数字/数组 序列化成了字符串。
             // 拿工具自身的 schema 跑一次类型 coerce,再 retry。
             let schema = (tool.parameters)();
-            if let Some(coerced) = tools::coerce::coerce_args_against_schema(&args_str, &schema) {
-                match (tool.from_args)(&coerced) {
-                    Ok(t) => {
-                        log::info!("[byop] tool 参数类型修复成功");
-                        return Ok(t);
-                    }
-                    Err(e2) => {
-                        log::warn!("[byop] tool 参数类型修复后仍解析失败");
-                        return Err(e2);
-                    }
-                }
-            }
-            log::warn!("[byop] tool 参数解析失败");
-            Err(e)
+            let Some(coerced) = tools::coerce::coerce_args_against_schema(&args_str, &schema)
+            else {
+                // 流式参数尚未收齐时会反复到达这里,只在最终调用失败时记录警告。
+                return Err(error);
+            };
+            (tool.from_args)(&coerced)?
         }
+    };
+    if let api::message::tool_call::Tool::ReadSkill(read_skill) = &mut parsed {
+        tools::skill::resolve_reference(read_skill, skills, skill_path_origin)?;
     }
+    Ok(parsed)
 }
 
 fn normalize_responses_tool_call_arguments(call: &mut ToolCall) {
@@ -8716,3 +8744,7 @@ mod compaction_tests;
 #[cfg(test)]
 #[path = "chat_stream_live_tests.rs"]
 mod live_tests;
+
+#[cfg(test)]
+#[path = "chat_stream_skill_tests.rs"]
+mod skill_tests;
