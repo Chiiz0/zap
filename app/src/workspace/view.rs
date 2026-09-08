@@ -10130,6 +10130,13 @@ impl Workspace {
                 .into_item(),
         );
 
+        #[cfg(not(target_family = "wasm"))]
+        items.push(
+            MenuItemFields::new(crate::t!("app-menu-cleanup-storage"))
+                .with_on_select_action(WorkspaceAction::CleanupStorage)
+                .into_item(),
+        );
+
         if !links::SLACK_URL.is_empty() {
             items.push(
                 MenuItemFields::new(crate::t!("workspace-menu-slack"))
